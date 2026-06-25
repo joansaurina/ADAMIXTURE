@@ -1,4 +1,4 @@
-from .cython import br_qn, bvls, em, snp_reader, tools
+from .cython import br_qn, bvls, em, snp_reader, tools, sqp
 from .cython.br_qn import deviance_squared_sum
 from .cython.bvls import batch_bvls_bpp, batch_nnls_bpp
 from .cython.snp_reader import (
@@ -25,6 +25,7 @@ __all__ = [
     "em",
     "snp_reader",
     "tools",
+    "sqp",
     "KL",
     "alleleFrequency",
     "batch_bvls_bpp",

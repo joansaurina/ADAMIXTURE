@@ -1,9 +1,10 @@
 import logging
 import sys
+import time
 
 import numpy as np
 
-from ..src.utils_c.cython import em, tools
+from ..src.utils_c.cython import em, tools, sqp
 from ..src.utils_c.cython.br_qn import qn_extrapolate_ZAL, update_UV_ZAL
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
@@ -191,4 +192,116 @@ def polish_br_qn(G: np.ndarray, P_init: np.ndarray, Q_init: np.ndarray,
             UtUmV_workspace, coeff_workspace
         )
 
+    return P, Q
+
+
+def optimize_original(G: np.ndarray, P: np.ndarray, Q: np.ndarray, max_iter: int, check: int,
+                      K: int, M: int, N: int, tol: float, Q_hist: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Description:
+    Optimizes the P and Q matrices using the original ADMIXTURE algorithm on CPU:
+    Sequential Quadratic Programming (SQP) block updates with ZAL Quasi-Newton acceleration.
+
+    Args:
+        G (np.ndarray): Input genotype matrix (M x N, uint8).
+        P (np.ndarray): Pre-initialized P matrix (M x K).
+        Q (np.ndarray): Pre-initialized Q matrix (N x K).
+        max_iter (int): Maximum SQP iterations.
+        check (int): Log-likelihood check frequency.
+        K (int): Number of ancestral populations.
+        M (int): Number of SNPs.
+        N (int): Number of individuals.
+        tol (float): Relative convergence tolerance.
+        Q_hist (int): Depth of ZAL Quasi-Newton acceleration history.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Optimized (P, Q) matrices.
+    """
+    ts = time.time()
+    
+    # 1. Precompute Vt matrix from SVD of ones(1, K)
+    _, _, vt = np.linalg.svd(np.ones((1, K)), full_matrices=True)
+    v_kk = np.ascontiguousarray(vt.T, dtype=np.float64)
+    
+    # 2. Allocate buffers
+    XtX_q = np.zeros((N, K, K), dtype=np.float64)
+    Xtz_q = np.zeros((N, K), dtype=np.float64)
+    XtX_p = np.zeros((M, K, K), dtype=np.float64)
+    Xtz_p = np.zeros((M, K), dtype=np.float64)
+    
+    P_next = np.zeros_like(P, dtype=np.float64)
+    Q_next = np.zeros_like(Q, dtype=np.float64)
+    P_next2 = np.zeros_like(P, dtype=np.float64)
+    Q_next2 = np.zeros_like(Q, dtype=np.float64)
+    
+    # QN history buffers
+    dim = M * K + N * K
+    U = np.zeros(dim * Q_hist, dtype=np.float64)
+    V = np.zeros(dim * Q_hist, dtype=np.float64)
+    UtUmV_workspace = np.zeros(Q_hist * (Q_hist + 1), dtype=np.float64)
+    coeff_workspace = np.zeros(Q_hist, dtype=np.float64)
+    
+    # 3. Initialize log-likelihood
+    ll_initial = tools.loglikelihood(G, P, Q)
+    ll_prev_iter = ll_initial
+    log.info(f"    Initial Log-likelihood: {ll_initial:.6f}")
+    
+    for it in range(1, max_iter + 1):
+        it_start = time.time()
+        
+        # --- SQP Update 1: (P, Q) -> (P_next, Q_next) ---
+        sqp.update_q_sqp(G, Q, Q_next, P, XtX_q, Xtz_q, v_kk, M, N, K)
+        sqp.update_p_sqp(G, Q_next, P, P_next, XtX_p, Xtz_p, M, N, K)
+        
+        # --- SQP Update 2: (P_next, Q_next) -> (P_next2, Q_next2) ---
+        sqp.update_q_sqp(G, Q_next, Q_next2, P_next, XtX_q, Xtz_q, v_kk, M, N, K)
+        sqp.update_p_sqp(G, Q_next2, P_next, P_next2, XtX_p, Xtz_p, M, N, K)
+        
+        # --- ZAL QN acceleration ---
+        x = _flatten_PQ(P, Q)
+        x_next = _flatten_PQ(P_next, Q_next)
+        x_next2 = _flatten_PQ(P_next2, Q_next2)
+        
+        update_UV_ZAL(U, V, x, x_next, x_next2, it, Q_hist, dim)
+        
+        n_cols = min(it, Q_hist)
+        x_qn = np.empty(dim, dtype=np.float64)
+        qn_extrapolate_ZAL(x_qn, x_next, x, U, V, n_cols, dim, UtUmV_workspace, coeff_workspace)
+        
+        P_qn = np.empty_like(P)
+        Q_qn = np.empty_like(Q)
+        _unflatten_PQ(x_qn, P_qn, Q_qn, M, N, K)
+        
+        sqp.project_p_box(P_qn, M, K)
+        sqp.project_q_simplex(Q_qn, N, K)
+        
+        # --- Conditional QN Acceptance ---
+        ll_qn = tools.loglikelihood(G, P_qn, Q_qn)
+        
+        if ll_qn > ll_prev_iter:
+            memoryview(P.ravel())[:] = memoryview(P_qn.ravel())
+            memoryview(Q.ravel())[:] = memoryview(Q_qn.ravel())
+            ll_new = ll_qn
+            step_type = "QN"
+        else:
+            memoryview(P.ravel())[:] = memoryview(P_next2.ravel())
+            memoryview(Q.ravel())[:] = memoryview(Q_next2.ravel())
+            ll_new = tools.loglikelihood(G, P_next2, Q_next2)
+            step_type = "basic"
+            
+        log.info(
+            f"    Iteration {it}, "
+            f"Log-likelihood: {ll_new:.6f} ({step_type}), "
+            f"Time: {time.time() - it_start:.3f}s"
+        )
+        
+        reldiff = abs((ll_new - ll_prev_iter) / ll_prev_iter) if ll_prev_iter != 0 else 0
+        if reldiff < tol:
+            log.info(f"    Converged at iteration {it} (log-likelihood relative increase = {reldiff:.6e} < {tol}).")
+            ll_prev_iter = ll_new
+            break
+            
+        ll_prev_iter = ll_new
+        
+    log.info(f"\n    Final log-likelihood: {ll_prev_iter:.6f}")
     return P, Q

@@ -243,6 +243,10 @@ def load_extensions(device: torch.device) -> None:
              sources=[os.path.join(current_dir, "utils_c", "cuda", "cv_mask_kernel.cu")],
              verbose=False, extra_cuda_cflags=cuda_flags, extra_cflags=cpp_flags)
 
+        load(name="sqp_kernel",
+             sources=[os.path.join(current_dir, "utils_c", "cuda", "sqp_kernel.cu")],
+             verbose=False, extra_cuda_cflags=cuda_flags, extra_cflags=cpp_flags)
+
 def get_unpacker(device: torch.device, threads_per_block: int) -> Callable[[torch.Tensor, int, int, int], torch.Tensor]:
     """
     Description:
