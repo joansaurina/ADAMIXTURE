@@ -33,6 +33,8 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument('--beta2', type=float, default=0.88, help='Adam beta2 (2nd moment decay) (default: 0.88).')
     parser.add_argument('--reg_adam', type=float, default=1e-8, help='Adam epsilon for numerical stability (default: 1e-8).')
     parser.add_argument('--original', action='store_true', default=False, help='Run the original ADMIXTURE algorithm (SQP block updates + ZAL QN) (default: False).')
+    parser.add_argument('--init_original', choices=['em', 'als'], default='em', help='Initialization for --original: random EM priming or SVD+ALS (default: em).')
+    parser.add_argument('--em_init_steps', type=int, default=5, help='Number of random-init EM priming steps for --original (default: 5).')
     parser.add_argument('--rtol', type=float, default=0.1, help='Convergence tolerance for original ADMIXTURE (default: 1e-7).')
     parser.add_argument('--Q_hist', type=int, default=3, help='History depth for ZAL Quasi-Newton acceleration (default: 3).')
 
@@ -60,7 +62,7 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument('--tol_als', type=float, default=1e-4, help='Convergence tolerance for ALS (default: 1e-4).')
     parser.add_argument('--power', type=int, default=5, help='Number of power iterations for SVD (default: 5).')
     parser.add_argument('--tol_svd', type=float, default=1e-1, help='Convergence tolerance for SVD (default: 1e-1).')
-    parser.add_argument('--chunk_size', type=int, default=4096, help='Number of SNPs in chunk operations for SVD (default: 4096).')
+    parser.add_argument('--chunk_size', type=int, default=8192, help='Number of SNPs in chunk operations for SVD (default: 8192).')
     parser.add_argument('--cv', nargs='?', const=5, default=0, type=int, help='Enable v-fold cross-validation on genotype entries (default: 5).')
 
     parser.add_argument('--plot', nargs='*', help='Generate a single combined plot of all Q matrices across the K sweep (Optional: [format] [resolution]) (default: png 300).')
@@ -254,6 +256,7 @@ def main() -> None:
     assert args.max_iter >= 1, "Maximum iterations (max_iter) must be at least 1."
     assert args.check >= 1, "Check frequency (check) must be at least 1."
     assert args.max_als >= 1, "Maximum ALS iterations (max_als) must be at least 1."
+    assert args.em_init_steps >= 0, "EM initialization steps (em_init_steps) must be non-negative."
     assert args.chunk_size >= 1, "Chunk size must be at least 1."
     assert args.tol_adam > 0, "Adam tolerance (tol_adam) must be positive."
     assert args.tol_als > 0, "ALS tolerance (tol_als) must be positive."

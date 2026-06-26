@@ -44,7 +44,7 @@ def main(args: argparse.Namespace, t0: float) -> int:
             G, N, M, K_max,
             int(args.seed), int(args.power), float(args.tol_svd),
             int(args.chunk_size), args.device,
-            original=args.original,
+            original=args.original, init_original=args.init_original,
         )
 
         trained: dict[int, tuple] = {}
@@ -64,6 +64,8 @@ def main(args: argparse.Namespace, t0: float) -> int:
                 int(args.patience_adam), float(args.tol_adam),
                 device_obj, threads_per_block,
                 original=args.original, rtol=args.rtol, Q_hist=args.Q_hist,
+                init_original=args.init_original,
+                em_init_steps=int(args.em_init_steps),
             )
 
             P_np = P.cpu().numpy() if isinstance(P, torch.Tensor) else P

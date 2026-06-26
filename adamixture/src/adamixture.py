@@ -1,13 +1,14 @@
 import logging
 import sys
+import time
 
 import numpy as np
 import torch
 
 from ..model.als import ALS
 from ..model.als_gpu import ALS_gpu
-from ..model.em_adam import optimize_parameters
-from ..model.em_adam_gpu import optimize_parameters_gpu
+from ..model.em_adam import emStep, optimize_parameters
+from ..model.em_adam_gpu import EMAdamOptimizer, optimize_parameters_gpu
 from ..model.br_qn import optimize_original
 from ..model.br_qn_gpu import optimize_original_gpu
 from ..model.svd import RSVD
@@ -19,7 +20,8 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, power: int,
-          tol_svd: float, chunk_size: int, device: str, original: bool = False) -> tuple:
+          tol_svd: float, chunk_size: int, device: str, original: bool = False,
+          init_original: str = 'em') -> tuple:
     """
     Description:
     One-time initialisation shared across all K values in a sweep:
@@ -36,7 +38,8 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
         tol_svd (float): Convergence tolerance for SVD.
         chunk_size (int): Chunk size for batched operations.
         device (str): Target device string ('cpu', 'cuda', 'mps').
-        original (bool): If True, bypass SVD calculation.
+        original (bool): If True, run original ADMIXTURE after initialization.
+        init_original (str): Initialization used by --original ('em' or 'als').
 
     Returns:
         tuple: (device_obj, threads_per_block, f, U, S, V, G) where G may
@@ -53,6 +56,12 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
     log.info(f"    Running on {str(device_obj).upper()}.\n")
     utils.load_extensions(device_obj)
     threads_per_block = utils.get_tuning_params(device_obj)
+
+    if original and init_original == 'em':
+        if device_obj.type != 'cpu':
+            G = utils.manage_gpu_memory(G, device_obj, M, N, K_max, chunk_size)
+        log.info("    Skipping SVD; --original uses random + EM initialization.\n")
+        return device_obj, threads_per_block, None, None, None, None, G
 
     if device_obj.type == 'cpu':
         f = np.zeros(M, dtype=np.float32)
@@ -72,10 +81,59 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
     return device_obj, threads_per_block, f, U, S, V, G
 
 
+def initialize_em_cpu(G: np.ndarray, seed: int, M: int, N: int, K: int,
+                      n_steps: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    t0 = time.time()
+    rng = np.random.default_rng(seed)
+    P = rng.random(size=(M, K), dtype=np.float64)
+    Q = rng.random(size=(N, K), dtype=np.float64)
+    tools.mapP_d(P, M, K)
+    tools.mapQ_d(Q, N, K)
+
+    P_next = np.empty_like(P)
+    Q_next = np.empty_like(Q)
+    T = np.zeros_like(Q)
+    q_bat = np.zeros(N, dtype=np.float64)
+
+    log.info(f"    Random initialization + {n_steps} EM initial steps...")
+    for i in range(n_steps):
+        emStep(G, P, Q, T, P_next, Q_next, q_bat, K, M, N)
+
+    log.info(f"        Total EM initialization time={time.time() - t0:.3f}s\n")
+    return P, Q
+
+
+def initialize_em_gpu(G: torch.Tensor, seed: int, M: int, N: int, K: int,
+                      device_obj: torch.device, chunk_size: int, threads_per_block: int,
+                      n_steps: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    t0 = time.time()
+    dtype = utils.get_dtype(device_obj)
+    generator = torch.Generator(device=device_obj)
+    generator.manual_seed(seed)
+    P = torch.rand((M, K), dtype=dtype, generator=generator, device=device_obj)
+    Q = torch.rand((N, K), dtype=dtype, generator=generator, device=device_obj)
+    torch.clamp_(P, 1e-5, 1.0 - 1e-5)
+    torch.clamp_(Q, 1e-5, 1.0 - 1e-5)
+    Q.div_(Q.sum(dim=1, keepdim=True))
+
+    optimizer = EMAdamOptimizer(P.shape, Q.shape, 0.0, 0.0, 0.0, 0.0, device_obj)
+    unpacker = utils.get_unpacker(device_obj, threads_per_block)
+
+    log.info(f"    Random initialization + {n_steps} EM initial steps...")
+    for i in range(n_steps):
+        optimizer.run_em_step(G, P, Q, M, chunk_size, unpacker)
+        P.copy_(optimizer.P_EM)
+        Q.copy_(optimizer.Q_EM)
+
+    log.info(f"        Total EM initialization time={time.time() - t0:.3f}s\n")
+    return P, Q
+
+
 def train_k(G: torch.Tensor | np.ndarray, N: int, M: int, K: int, U_max: np.ndarray | torch.Tensor, S_max: np.ndarray | torch.Tensor,
         V_max: np.ndarray | torch.Tensor, f: np.ndarray | torch.Tensor, seed: int, lr: float, beta1: float, beta2: float, reg_adam: float,
         max_iter: int, check: int, max_als: int, tol_als: float, lr_decay: float, min_lr: float, chunk_size: int, patience_adam: int, tol_adam: float,
-        device_obj: torch.device, threads_per_block: int, original: bool = False, rtol: float = 1e-7, Q_hist: int = 3) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
+        device_obj: torch.device, threads_per_block: int, original: bool = False, rtol: float = 1e-7, Q_hist: int = 3,
+        init_original: str = 'em', em_init_steps: int = 5) -> tuple[np.ndarray, np.ndarray] | tuple[torch.Tensor, torch.Tensor]:
     """
     Description:
     Trains ADAMIXTURE for a single K value, using pre-computed SVD results.
@@ -109,6 +167,7 @@ def train_k(G: torch.Tensor | np.ndarray, N: int, M: int, K: int, U_max: np.ndar
         original (bool): If True, run original ADMIXTURE algorithm.
         rtol (float): Convergence tolerance for original ADMIXTURE.
         Q_hist (int): History depth for original ADMIXTURE.
+        init_original (str): Initialization used by --original ('em' or 'als').
 
     Returns:
         tuple: (P, Q) — numpy arrays on CPU, GPU tensors on CUDA/MPS.
@@ -118,8 +177,11 @@ def train_k(G: torch.Tensor | np.ndarray, N: int, M: int, K: int, U_max: np.ndar
     V = V_max[:, :K] if V_max is not None else None
 
     if device_obj.type == 'cpu':
-        log.info("    Running ALS...")
-        P, Q = ALS(U, S, V, f, seed, M, N, K, max_als, tol_als)
+        if original and init_original == 'em':
+            P, Q = initialize_em_cpu(G, seed, M, N, K, em_init_steps)
+        else:
+            log.info("    Running ALS...")
+            P, Q = ALS(U, S, V, f, seed, M, N, K, max_als, tol_als)
         logl = tools.loglikelihood(G, P, Q)
         log.info(f"    Initial log-likelihood for K={K}: {logl:.1f}.")
 
@@ -131,7 +193,9 @@ def train_k(G: torch.Tensor | np.ndarray, N: int, M: int, K: int, U_max: np.ndar
             P, Q = optimize_parameters(G, P, Q, lr, beta1, beta2, reg_adam, max_iter,
                                        check, K, M, N, lr_decay, min_lr, patience_adam, tol_adam)
     else:
-        if device_obj.type == 'mps':
+        if original and init_original == 'em':
+            P, Q = initialize_em_gpu(G, seed, M, N, K, device_obj, chunk_size, threads_per_block, em_init_steps)
+        elif device_obj.type == 'mps':
             log.info("    Running ALS on CPU (device is MPS)...")
             U_cpu = U.cpu().numpy()
             S_cpu = S.cpu().numpy()
