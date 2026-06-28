@@ -32,16 +32,15 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument('--beta1', type=float, default=0.80, help='Adam beta1 (1st moment decay) (default: 0.80).')
     parser.add_argument('--beta2', type=float, default=0.88, help='Adam beta2 (2nd moment decay) (default: 0.88).')
     parser.add_argument('--reg_adam', type=float, default=1e-8, help='Adam epsilon for numerical stability (default: 1e-8).')
-    parser.add_argument('--original', action='store_true', default=False, help='Run the original ADMIXTURE algorithm (SQP block updates + ZAL QN) (default: False).')
-    parser.add_argument('--init_original', choices=['em', 'als'], default='em', help='Initialization for --original: random EM priming or SVD+ALS (default: em).')
-    parser.add_argument('--em_init_steps', type=int, default=5, help='Number of random-init EM priming steps for --original (default: 5).')
-    parser.add_argument('--rtol', type=float, default=0.1, help='Convergence tolerance for original ADMIXTURE (default: 1e-7).')
+    parser.add_argument('--algorithm', choices=['brqn', 'adamem'], default='brqn', help='Algorithm to use (brqn for SQP+ZAL QN, adamem for Adam-EM) (default: brqn).')
+    parser.add_argument('--init', choices=['em', 'als'], default='als', help='Initialization method: random EM priming or SVD+ALS (default: als).')
+    parser.add_argument('--em_init_steps', type=int, default=5, help='Number of random-init EM priming steps for brqn (default: 5).')
     parser.add_argument('--Q_hist', type=int, default=3, help='History depth for ZAL Quasi-Newton acceleration (default: 3).')
 
     parser.add_argument('--lr_decay', type=float, default=0.5, help='Learning rate decay factor (default: 0.5).')
     parser.add_argument('--min_lr', type=float, default=1e-4, help='Minimum learning rate value (default: 1e-4).')
     parser.add_argument('--patience_adam', type=int, default=3, help='Patience for reducing the learning rate in Adam-EM (default: 3).')
-    parser.add_argument('--tol_adam', type=float, default=0.1, help='Tolerance for stopping the Adam-EM algorithm (default: 0.1).')
+    parser.add_argument('--tol', type=float, default=0.1, help='Convergence tolerance (default: 0.1).')
 
     parser.add_argument('-s', '--seed', required=False, type=int, default=42, help='Seed (default: 42).')
     parser.add_argument('-k', '--k', required=False, type=int, help='Number of populations/clusters (single run).')
@@ -122,8 +121,8 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     if has_range and args.min_k > args.max_k:
         parser.error("--min_k must be <= --max_k.")
 
-    if args.rtol <= 0.0:
-        parser.error("--rtol must be greater than 0.")
+    if args.tol <= 0.0:
+        parser.error("--tol must be greater than 0.")
     if args.Q_hist < 1:
         parser.error("--Q_hist must be at least 1.")
 
@@ -258,7 +257,7 @@ def main() -> None:
     assert args.max_als >= 1, "Maximum ALS iterations (max_als) must be at least 1."
     assert args.em_init_steps >= 0, "EM initialization steps (em_init_steps) must be non-negative."
     assert args.chunk_size >= 1, "Chunk size must be at least 1."
-    assert args.tol_adam > 0, "Adam tolerance (tol_adam) must be positive."
+    assert args.tol > 0, "Tolerance (tol) must be positive."
     assert args.tol_als > 0, "ALS tolerance (tol_als) must be positive."
     assert args.tol_svd > 0, "SVD tolerance (tol_svd) must be positive."
     assert args.reg_adam >= 0, "Adam regularization (reg_adam) must be non-negative."

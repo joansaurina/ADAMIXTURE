@@ -66,9 +66,11 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument("--lr_decay",      type=float, default=0.5,    help="Learning rate decay factor (default: 0.5).")
     parser.add_argument("--min_lr",        type=float, default=1e-4,   help="Minimum learning rate (default: 1e-4).")
     parser.add_argument("--patience_adam", type=int,   default=3,      help="Patience for lr reduction (default: 3).")
-    parser.add_argument("--tol_adam",      type=float, default=0.1,    help="Convergence tolerance (default: 0.1).")
+    parser.add_argument("--tol",           type=float, default=0.1,    help="Convergence tolerance (default: 0.1).")
     parser.add_argument("--max_iter",      type=int,   default=10000,  help="Maximum Adam-EM iterations (default: 10000).")
     parser.add_argument("--check",         type=int,   default=5,      help="Log-likelihood check frequency (default: 5).")
+    parser.add_argument('--algorithm', choices=['brqn', 'adamem'], default='brqn', help='Algorithm to use (brqn for SQP+ZAL QN, adamem for Adam-EM) (default: brqn).')
+    parser.add_argument('--Q_hist', type=int, default=3, help='History depth for ZAL Quasi-Newton acceleration (default: 3).')
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     parser.add_argument("-s", "--seed",    type=int,   default=42,     help="Random seed (default: 42).")
@@ -129,10 +131,11 @@ def main() -> None:
     assert args.max_iter >= 1, "Maximum iterations (max_iter) must be at least 1."
     assert args.check >= 1, "Check frequency (check) must be at least 1."
     assert args.chunk_size >= 1, "Chunk size must be at least 1."
-    assert args.tol_adam > 0, "Adam tolerance (tol_adam) must be positive."
+    assert args.tol > 0, "Tolerance (tol) must be positive."
     assert args.reg_adam >= 0, "Adam regularization (reg_adam) must be non-negative."
     assert args.plot_format in ['pdf', 'png', 'jpg'], "Plot format must be pdf, png or jpg."
     assert 50 <= args.plot_dpi <= 1200, "Plot resolution must be between 50 and 1200."
+    assert args.Q_hist >= 1, "Q_hist must be at least 1."
 
     # Thread control
     th = str(args.threads)
@@ -155,7 +158,12 @@ def main() -> None:
     from pathlib import Path
 
     from .src import utils
-    from .src.projection import optimize_projection, optimize_projection_gpu
+    from .src.projection import (
+        optimize_projection,
+        optimize_projection_gpu,
+        optimize_projection_original,
+        optimize_projection_original_gpu,
+    )
 
     device_str = args.device
     use_gpu = device_str in ("cuda", "mps")
@@ -169,7 +177,7 @@ def main() -> None:
         log.error(f"    Error: P matrix file not found: {p_path}")
         sys.exit(1)
 
-    log.info(f"    Loading pre-trained P matrix from: {p_path}")
+    log.info("    Loading pre-trained P matrix.")
     P = np.loadtxt(str(p_path), dtype=np.float64)
     if P.ndim == 1:
         P = P.reshape(-1, 1)
@@ -194,7 +202,10 @@ def main() -> None:
     Q = rng.random(size=(N, K)).astype(np.float64)
     Q /= Q.sum(axis=1, keepdims=True)
 
-    log.info("    Running Adam-EM projection (P fixed)...\n")
+    if args.algorithm == 'brqn':
+        log.info("    Running SQP + ZAL QN projection (P fixed)...\n")
+    else:
+        log.info("    Running Adam-EM projection (P fixed)...\n")
 
     # ── Run projection ────────────────────────────────────────────────────────
     if use_gpu:
@@ -206,23 +217,36 @@ def main() -> None:
         P_t = torch.tensor(P, dtype=utils.get_dtype(device_obj), device=device_obj)
         Q_t = torch.tensor(Q, dtype=utils.get_dtype(device_obj), device=device_obj)
         G_t = utils.manage_gpu_memory(G_t, device_obj, M, N, K, args.chunk_size)
-        Q_gpu = optimize_projection_gpu(
-            G=G_t, P=P_t, Q=Q_t,
-            lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
-            max_iter=args.max_iter, check=args.check, M=M,
-            lr_decay=args.lr_decay, min_lr=args.min_lr,
-            patience_adam=args.patience_adam, tol_adam=args.tol_adam,
-            device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
-        )
+        if args.algorithm == 'brqn':
+            Q_gpu = optimize_projection_original_gpu(
+                G=G_t, P=P_t, Q=Q_t,
+                max_iter=args.max_iter, K=K, M=M, N=N, tol=args.tol, Q_hist=args.Q_hist,
+                device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
+            )
+        else:
+            Q_gpu = optimize_projection_gpu(
+                G=G_t, P=P_t, Q=Q_t,
+                lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
+                max_iter=args.max_iter, check=args.check, M=M,
+                lr_decay=args.lr_decay, min_lr=args.min_lr,
+                patience_adam=args.patience_adam, tol_adam=args.tol,
+                device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
+            )
         Q_opt = Q_gpu.cpu().numpy()
     else:
-        Q_opt = optimize_projection(
-            G=G, P=P, Q=Q,
-            lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
-            max_iter=args.max_iter, check=args.check, K=K, M=M, N=N,
-            lr_decay=args.lr_decay, min_lr=args.min_lr,
-            patience_adam=args.patience_adam, tol_adam=args.tol_adam,
-        )
+        if args.algorithm == 'brqn':
+            Q_opt = optimize_projection_original(
+                G=G, P=P, Q=Q,
+                max_iter=args.max_iter, K=K, M=M, N=N, tol=args.tol, Q_hist=args.Q_hist,
+            )
+        else:
+            Q_opt = optimize_projection(
+                G=G, P=P, Q=Q,
+                lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
+                max_iter=args.max_iter, check=args.check, K=K, M=M, N=N,
+                lr_decay=args.lr_decay, min_lr=args.min_lr,
+                patience_adam=args.patience_adam, tol_adam=args.tol,
+            )
 
     # ── Save output ───────────────────────────────────────────────────────────
     out_path = Path(args.save_dir)

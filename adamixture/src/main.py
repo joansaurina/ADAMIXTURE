@@ -44,7 +44,7 @@ def main(args: argparse.Namespace, t0: float) -> int:
             G, N, M, K_max,
             int(args.seed), int(args.power), float(args.tol_svd),
             int(args.chunk_size), args.device,
-            original=args.original, init_original=args.init_original,
+            original=(args.algorithm == 'brqn'), init_original=args.init,
         )
 
         trained: dict[int, tuple] = {}
@@ -61,10 +61,10 @@ def main(args: argparse.Namespace, t0: float) -> int:
                 float(args.reg_adam), int(args.max_iter), int(args.check),
                 int(args.max_als), float(args.tol_als),
                 float(args.lr_decay), float(args.min_lr), int(args.chunk_size),
-                int(args.patience_adam), float(args.tol_adam),
+                int(args.patience_adam), float(args.tol),
                 device_obj, threads_per_block,
-                original=args.original, rtol=args.rtol, Q_hist=args.Q_hist,
-                init_original=args.init_original,
+                original=(args.algorithm == 'brqn'), rtol=float(args.tol), Q_hist=args.Q_hist,
+                init_original=args.init,
                 em_init_steps=int(args.em_init_steps),
             )
 

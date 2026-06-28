@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from . import utils
-from .utils_c import em, tools
+from .utils_c import em, tools, sqp
 
 if TYPE_CHECKING:
     import torch
@@ -315,4 +315,234 @@ def optimize_projection_gpu(G: "torch.Tensor", P: "torch.Tensor", Q: "torch.Tens
                     wait_lr = 0
 
     log.info(f"\n    Final log-likelihood (projection): {L_best:.1f}")
+    return Q_best
+
+
+def _flatten_Q_inplace(Q: np.ndarray, out: np.ndarray) -> None:
+    memoryview(out[:])[:] = Q.ravel()
+
+
+def _unflatten_Q(x: np.ndarray, Q_out: np.ndarray, N: int, K: int) -> None:
+    memoryview(Q_out.ravel())[:] = memoryview(x[:])
+
+
+def optimize_projection_original(G: np.ndarray, P: np.ndarray, Q: np.ndarray,
+                                 max_iter: int, K: int, M: int, N: int, tol: float, Q_hist: int) -> np.ndarray:
+    """
+    Description:
+    Projects target samples onto pre-trained allele frequencies P using the
+    original ADMIXTURE algorithm (SQP updates + ZAL QN acceleration on Q) on CPU.
+    """
+    from .utils_c.cython.br_qn import qn_extrapolate_ZAL, update_UV_ZAL
+
+    # 1. Precompute Vt matrix from SVD of ones(1, K)
+    _, _, vt = np.linalg.svd(np.ones((1, K)), full_matrices=True)
+    v_kk = np.ascontiguousarray(vt.T, dtype=np.float64)
+    
+    # 2. Allocate buffers
+    XtX_q = np.empty((N, K, K), dtype=np.float64)
+    Xtz_q = np.empty((N, K), dtype=np.float64)
+    
+    Q_next = np.empty_like(Q, dtype=np.float64)
+    Q_next2 = np.empty_like(Q, dtype=np.float64)
+    
+    # QN history buffers on Q only (dim = N * K)
+    dim = N * K
+    U = np.zeros(dim * Q_hist, dtype=np.float64)
+    V = np.zeros(dim * Q_hist, dtype=np.float64)
+    UtUmV_workspace = np.zeros(Q_hist * (Q_hist + 1), dtype=np.float64)
+    coeff_workspace = np.zeros(Q_hist, dtype=np.float64)
+    
+    # QN extrapolation buffers
+    x_qn = np.empty(dim, dtype=np.float64)
+    Q_qn = np.empty_like(Q)
+    
+    # Pre-allocated buffers for ZAL QN acceleration
+    x_buf = np.empty(dim, dtype=np.float64)
+    x_next_buf = np.empty(dim, dtype=np.float64)
+    x_next2_buf = np.empty(dim, dtype=np.float64)
+    
+    # 3. Initialize log-likelihood
+    ll_prev_iter = -float('inf')
+    ll_best = -float("inf")
+    Q_best = np.empty_like(Q)
+    
+    for it in range(1, max_iter + 1):
+        it_start = time.time()
+        
+        # --- SQP Update 1: Q -> Q_next ---
+        sqp.update_q_sqp(G, Q, Q_next, P, XtX_q, Xtz_q, v_kk, M, N, K)
+        
+        # --- SQP Update 2: Q_next -> Q_next2 ---
+        sqp.update_q_sqp(G, Q_next, Q_next2, P, XtX_q, Xtz_q, v_kk, M, N, K)
+        
+        # --- ZAL QN acceleration ---
+        _flatten_Q_inplace(Q, x_buf)
+        _flatten_Q_inplace(Q_next, x_next_buf)
+        _flatten_Q_inplace(Q_next2, x_next2_buf)
+        
+        update_UV_ZAL(U, V, x_buf, x_next_buf, x_next2_buf, it, Q_hist, dim)
+        
+        n_cols = min(it, Q_hist)
+        qn_extrapolate_ZAL(x_qn, x_next_buf, x_buf, U, V, n_cols, dim, UtUmV_workspace, coeff_workspace)
+        
+        _unflatten_Q(x_qn, Q_qn, N, K)
+        sqp.project_q_simplex(Q_qn, N, K)
+        
+        # --- Conditional QN Acceptance ---
+        ll_qn = tools.loglikelihood(G, P, Q_qn)
+        
+        if ll_qn > ll_prev_iter:
+            memoryview(Q.ravel())[:] = memoryview(Q_qn.ravel())
+            ll_new = ll_qn
+        else:
+            memoryview(Q.ravel())[:] = memoryview(Q_next2.ravel())
+            ll_new = tools.loglikelihood(G, P, Q_next2)
+        
+        if ll_new > ll_best:
+            ll_best = ll_new
+            memoryview(Q_best.ravel())[:] = memoryview(Q.ravel())
+            
+        log.info(
+            f"    Iteration {it}, "
+            f"Log-likelihood: {ll_new:.1f}, "
+            f"Time: {time.time() - it_start:.3f}s"
+        )
+        
+        diff = ll_new - ll_prev_iter
+        if 0 <= diff < tol:
+            log.info(f"    Converged at iteration {it}.")
+            break
+
+        ll_prev_iter = ll_new
+        
+    log.info(f"\n    Final log-likelihood (projection): {ll_best:.1f}")
+    return Q_best
+
+
+def _flatten_Q_gpu_inplace(Q: "torch.Tensor", out: "torch.Tensor") -> None:
+    out[:].copy_(Q.ravel())
+
+
+def _unflatten_Q_gpu(x: "torch.Tensor", Q: "torch.Tensor") -> None:
+    Q.copy_(x.view(-1, Q.shape[1]))
+
+
+def optimize_projection_original_gpu(G: "torch.Tensor", P: "torch.Tensor", Q: "torch.Tensor",
+                                     max_iter: int, K: int, M: int, N: int, tol: float, Q_hist: int,
+                                     device: "torch.device", chunk_size: int, threads_per_block: int) -> "torch.Tensor":
+    """
+    Description:
+    Projects target samples onto pre-trained allele frequencies P using the
+    original ADMIXTURE algorithm (SQP updates + ZAL QN acceleration on Q) on GPU.
+    """
+    import torch
+    from ..model.br_qn_gpu import compute_grad_hess_Q_gpu
+
+    # 1. Precompute Vt matrix from SVD of ones(1, K) on GPU
+    ones_K = torch.ones((1, K), dtype=torch.float64, device=device)
+    _, _, vt = torch.linalg.svd(ones_K, full_matrices=True)
+    v_kk = vt.t().contiguous()
+    
+    # 2. Allocate buffers on GPU
+    dtype = utils.get_dtype(device)
+    XtX_q = torch.zeros((N, K, K), dtype=torch.float64, device=device)
+    Xtz_q = torch.zeros((N, K), dtype=torch.float64, device=device)
+    
+    # QN history buffers on Q only (dim = N * K)
+    dim = N * K
+    U = torch.zeros((dim, Q_hist), dtype=torch.float64, device=device)
+    V = torch.zeros((dim, Q_hist), dtype=torch.float64, device=device)
+    UV_diff = torch.zeros((dim, Q_hist), dtype=torch.float64, device=device)
+    Q_qn = torch.empty_like(Q)
+    
+    # Pre-allocated buffers for ZAL QN acceleration
+    x_qn = torch.empty(dim, dtype=torch.float64, device=device)
+    x_buf = torch.empty(dim, dtype=torch.float64, device=device)
+    x_next_buf = torch.empty(dim, dtype=torch.float64, device=device)
+    x_next2_buf = torch.empty(dim, dtype=torch.float64, device=device)
+    
+    unpacker = utils.get_unpacker(device, threads_per_block)
+    logl_calc = utils.get_logl_calculator(device)
+    
+    # --- Initialize log-likelihood ---
+    ll_prev_iter = -float('inf')
+    ll_best = -float("inf")
+    Q_best = torch.empty_like(Q)
+    
+    for it in range(1, max_iter + 1):
+        it_start = time.time()
+        
+        # --- SQP Update 1: Q -> Q_next ---
+        compute_grad_hess_Q_gpu(G, Q, P, XtX_q, Xtz_q, M, chunk_size, unpacker, dtype)
+        Xtz_q.neg_()
+        Q_next = torch.ops.sqp_kernel.sqp_solve_q_cuda(XtX_q, Xtz_q, Q, v_kk, N, K)
+        
+        # --- SQP Update 2: Q_next -> Q_next2 ---
+        compute_grad_hess_Q_gpu(G, Q_next, P, XtX_q, Xtz_q, M, chunk_size, unpacker, dtype)
+        Xtz_q.neg_()
+        Q_next2 = torch.ops.sqp_kernel.sqp_solve_q_cuda(XtX_q, Xtz_q, Q_next, v_kk, N, K)
+        
+        # --- ZAL QN acceleration ---
+        _flatten_Q_gpu_inplace(Q, x_buf)
+        _flatten_Q_gpu_inplace(Q_next, x_next_buf)
+        _flatten_Q_gpu_inplace(Q_next2, x_next2_buf)
+        
+        col = (it - 1) % Q_hist
+        torch.sub(x_next_buf, x_buf, out=U[:, col])
+        torch.sub(x_next2_buf, x_next_buf, out=V[:, col])
+        
+        n_cols = min(it, Q_hist)
+        U_sub = U[:, :n_cols]
+        V_sub = V[:, :n_cols]
+        
+        torch.sub(U_sub, V_sub, out=UV_diff[:, :n_cols])
+        LHS = U_sub.T @ UV_diff[:, :n_cols]
+        
+        torch.sub(x_buf, x_next_buf, out=x_qn)
+        RHS = U_sub.T @ x_qn
+        
+        try:
+            alpha = torch.linalg.solve(LHS, RHS)
+        except RuntimeError:
+            alpha = torch.linalg.lstsq(LHS, RHS).solution
+            
+        # x_qn = x_next_buf - V_sub @ alpha
+        torch.matmul(V_sub, alpha, out=x_qn)
+        torch.sub(x_next_buf, x_qn, out=x_qn)
+        
+        _unflatten_Q_gpu(x_qn, Q_qn)
+        
+        # Project Q to simplex
+        torch.clamp_(Q_qn, 1e-5, 1.0 - 1e-5)
+        Q_qn.div_(Q_qn.sum(dim=1, keepdim=True))
+        
+        # --- Conditional QN Acceptance ---
+        ll_qn = logl_calc(G, P, Q_qn, M, N, chunk_size, threads_per_block)
+        
+        if ll_qn > ll_prev_iter:
+            Q.copy_(Q_qn)
+            ll_new = ll_qn
+        else:
+            Q.copy_(Q_next2)
+            ll_new = logl_calc(G, P, Q_next2, M, N, chunk_size, threads_per_block)
+ 
+        if ll_new > ll_best:
+            ll_best = ll_new
+            Q_best.copy_(Q)
+ 
+        log.info(
+            f"    Iteration {it}, "
+            f"Log-likelihood: {ll_new:.1f}, "
+            f"Time: {time.time() - it_start:.3f}s"
+        )
+        
+        diff = ll_new - ll_prev_iter
+        if 0 <= diff < tol:
+            log.info(f"    Converged at iteration {it}.")
+            break
+            
+        ll_prev_iter = ll_new
+        
+    log.info(f"\n    Final log-likelihood (projection): {ll_best:.1f}")
     return Q_best

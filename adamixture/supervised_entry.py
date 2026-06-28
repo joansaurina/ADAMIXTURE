@@ -74,9 +74,11 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument("--lr_decay",      type=float, default=0.5,    help="Learning rate decay factor (default: 0.5).")
     parser.add_argument("--min_lr",        type=float, default=1e-4,   help="Minimum learning rate (default: 1e-4).")
     parser.add_argument("--patience_adam", type=int,   default=3,      help="Patience for lr reduction (default: 3).")
-    parser.add_argument("--tol_adam",      type=float, default=0.1,    help="Convergence tolerance (default: 0.1).")
+    parser.add_argument("--tol",           type=float, default=0.1,    help="Convergence tolerance (default: 0.1).")
     parser.add_argument("--max_iter",      type=int,   default=10000,  help="Maximum Adam-EM iterations (default: 10000).")
     parser.add_argument("--check",         type=int,   default=5,      help="Log-likelihood check frequency (default: 5).")
+    parser.add_argument('--algorithm', choices=['brqn', 'adamem'], default='brqn', help='Algorithm to use (brqn for SQP+ZAL QN, adamem for Adam-EM) (default: brqn).')
+    parser.add_argument('--Q_hist', type=int, default=3, help='History depth for ZAL Quasi-Newton acceleration (default: 3).')
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     parser.add_argument("-s", "--seed",    type=int,   default=42,     help="Random seed (default: 42).")
@@ -211,10 +213,11 @@ def main() -> None:
     assert args.max_iter >= 1, "Maximum iterations (max_iter) must be at least 1."
     assert args.check >= 1, "Check frequency (check) must be at least 1."
     assert args.chunk_size >= 1, "Chunk size must be at least 1."
-    assert args.tol_adam > 0, "Adam tolerance (tol_adam) must be positive."
+    assert args.tol > 0, "Tolerance (tol) must be positive."
     assert args.reg_adam >= 0, "Adam regularization (reg_adam) must be non-negative."
     assert args.plot_format in ['pdf', 'png', 'jpg'], "Plot format must be pdf, png or jpg."
     assert 50 <= args.plot_dpi <= 1200, "Plot resolution must be between 50 and 1200."
+    assert args.Q_hist >= 1, "Q_hist must be at least 1."
 
     # Thread control
     th = str(args.threads)
@@ -239,6 +242,8 @@ def main() -> None:
         init_q_supervised,
         optimize_supervised,
         optimize_supervised_gpu,
+        optimize_supervised_original,
+        optimize_supervised_original_gpu,
     )
 
     device_str = args.device
@@ -279,7 +284,10 @@ def main() -> None:
     Q /= Q.sum(axis=1, keepdims=True)
     init_q_supervised(Q, y, K)
 
-    log.info("    Running supervised Adam-EM...\n")
+    if args.algorithm == 'brqn':
+        log.info("    Running supervised SQP + ZAL QN...\n")
+    else:
+        log.info("    Running supervised Adam-EM...\n")
 
     # ── Run supervised optimisation ──────────────────────────────────────────────
     if use_gpu:
@@ -290,24 +298,37 @@ def main() -> None:
         P_t = torch.tensor(P, dtype=utils.get_dtype(device_obj), device=device_obj)
         Q_t = torch.tensor(Q, dtype=utils.get_dtype(device_obj), device=device_obj)
         G_t = utils.manage_gpu_memory(G_t, device_obj, M, N, K, args.chunk_size)
-        P_gpu, Q_gpu = optimize_supervised_gpu(
-            G=G_t, P=P_t, Q=Q_t, y=y,
-            lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
-            max_iter=args.max_iter, check=args.check, M=M,
-            lr_decay=args.lr_decay, min_lr=args.min_lr,
-            patience_adam=args.patience_adam, tol_adam=args.tol_adam,
-            device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
-        )
+        if args.algorithm == 'brqn':
+            P_gpu, Q_gpu = optimize_supervised_original_gpu(
+                G=G_t, P=P_t, Q=Q_t, y=y,
+                max_iter=args.max_iter, K=K, M=M, N=N, tol=args.tol, Q_hist=args.Q_hist,
+                device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
+            )
+        else:
+            P_gpu, Q_gpu = optimize_supervised_gpu(
+                G=G_t, P=P_t, Q=Q_t, y=y,
+                lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
+                max_iter=args.max_iter, check=args.check, M=M,
+                lr_decay=args.lr_decay, min_lr=args.min_lr,
+                patience_adam=args.patience_adam, tol_adam=args.tol,
+                device=device_obj, chunk_size=args.chunk_size, threads_per_block=threads_per_block,
+            )
         P_opt = P_gpu.cpu().numpy()
         Q_opt = Q_gpu.cpu().numpy()
     else:
-        P_opt, Q_opt = optimize_supervised(
-            G=G, P=P, Q=Q, y=y,
-            lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
-            max_iter=args.max_iter, check=args.check, K=K, M=M, N=N,
-            lr_decay=args.lr_decay, min_lr=args.min_lr,
-            patience_adam=args.patience_adam, tol_adam=args.tol_adam,
-        )
+        if args.algorithm == 'brqn':
+            P_opt, Q_opt = optimize_supervised_original(
+                G=G, P=P, Q=Q, y=y,
+                max_iter=args.max_iter, K=K, M=M, N=N, tol=args.tol, Q_hist=args.Q_hist,
+            )
+        else:
+            P_opt, Q_opt = optimize_supervised(
+                G=G, P=P, Q=Q, y=y,
+                lr=args.lr, beta1=args.beta1, beta2=args.beta2, reg_adam=args.reg_adam,
+                max_iter=args.max_iter, check=args.check, K=K, M=M, N=N,
+                lr_decay=args.lr_decay, min_lr=args.min_lr,
+                patience_adam=args.patience_adam, tol_adam=args.tol,
+            )
 
     # ── Save outputs ──────────────────────────────────────────────────────────
     out_path = Path(args.save_dir)
