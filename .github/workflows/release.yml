@@ -39,9 +39,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m ensurepip --upgrade
           python -m pip install --upgrade pip
-          python -m pip install tox
+          python -m pip install tox tox-gh-actions
 
       - name: Test with tox
         uses: GabrielBB/xvfb-action@v1
