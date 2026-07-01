@@ -6,91 +6,20 @@ from libc.stdint cimport uint8_t, uint32_t, uintptr_t, int32_t, uint64_t
 import gzip
 import numpy as np
 
-# Decompress PLINK BED to uint8
-cpdef void read_bed(unsigned char[:,::1] bed_source, unsigned char[:,::1] geno_target) noexcept nogil:
+cpdef void replace_missing_with_three(signed char[:, ::1] G) noexcept nogil:
     """
-    Description:
-    Decompresses a PLINK BED source matrix (packed genotypes) into a uint8 target matrix.
-
-    Args:
-        bed_source (unsigned char[:,::1]): Input matrix of raw BED bytes (SNPs x samples/4).
-        geno_target (unsigned char[:,::1]): Output matrix of genotypes (SNPs x samples).
-
-    Returns:
-        None
+    Replace pgenlib missing genotype values (-9) with ADAMIXTURE's missing code (3).
     """
     cdef:
-        size_t n_snps = geno_target.shape[0]
-        size_t n_samples = geno_target.shape[1]
-        size_t byte_count = bed_source.shape[1]
-        size_t snp_idx, byte_pos, byte_offset, sample_pos
-        unsigned char current_byte, geno_value
-        unsigned char[4] lookup_table = [2, 3, 1, 0]
-    
-    with nogil, parallel():
-        for snp_idx in prange(n_snps):
-            for byte_pos in range(byte_count):
-                current_byte = bed_source[snp_idx, byte_pos]
-                sample_pos = byte_pos * 4
-
-                if sample_pos < n_samples:
-                    geno_target[snp_idx, sample_pos] = lookup_table[current_byte & 3]
-                    if sample_pos + 1 < n_samples:
-                        geno_target[snp_idx, sample_pos + 1] = lookup_table[(current_byte >> 2) & 3]
-                        if sample_pos + 2 < n_samples:
-                            geno_target[snp_idx, sample_pos + 2] = lookup_table[(current_byte >> 4) & 3]
-                            if sample_pos + 3 < n_samples:
-                                geno_target[snp_idx, sample_pos + 3] = lookup_table[(current_byte >> 6) & 3]
-
-# Read BED to 2-bit packed format
-cpdef void read_bed_packed(uintptr_t B_bed_ptr, uintptr_t G_packed_ptr, Py_ssize_t M, Py_ssize_t N_bytes, Py_ssize_t N, Py_ssize_t M_bytes) noexcept nogil:
-    """
-    Description:
-    Reads a BED file and converts it into a 2-bit packed format optimized for GPU processing.
-    Each output byte contains 4 SNPs for a single sample.
-
-    Args:
-        B_bed_ptr (uintptr_t): Memory pointer to the raw BED data.
-        G_packed_ptr (uintptr_t): Memory pointer for the output packed genotypes.
-        M (Py_ssize_t): Total number of SNPs.
-        N_bytes (Py_ssize_t): Number of bytes per SNP in the source BED file.
-        N (Py_ssize_t): Number of individuals.
-        M_bytes (Py_ssize_t): ceil(M / 4), the number of packed bytes in the output.
-
-    Returns:
-        None
-    """
-    cdef:
-        const uint8_t* B_bed = <const uint8_t*> B_bed_ptr
-        uint8_t* G_packed = <uint8_t*> G_packed_ptr
-        Py_ssize_t i, j, k, byte_idx
-        Py_ssize_t snp_idx
-        int bit_in
-        uint8_t byte_in, val
-        uint8_t mask = 3
-        unsigned char[4] lookup_table = [2, 3, 1, 0]
-        uint8_t* out_row
+        size_t M = G.shape[0]
+        size_t N = G.shape[1]
+        size_t i, j
 
     with nogil, parallel():
-        for i in prange(N, schedule='guided'):
-            # Each sample i
-            for j in range(M_bytes):
-                # Each packed byte j in the output (contains SNPs 4j...4j+3)
-                out_row = G_packed + j * N + i
-                out_row[0] = 0
-                
-                for k in range(4):
-                    snp_idx = j * 4 + k
-                    if snp_idx >= M:
-                        break
-                    
-                    # Byte in BED file for snp_idx that contains sample i
-                    byte_idx = i // 4
-                    bit_in = (i % 4) * 2
-                    byte_in = B_bed[snp_idx * N_bytes + byte_idx]
-                    val = lookup_table[(byte_in >> bit_in) & mask]
-                    
-                    out_row[0] |= (val & 0x03) << (2 * k)
+        for i in prange(M, schedule='guided'):
+            for j in range(N):
+                if G[i, j] < 0:
+                    G[i, j] = 3
 
 # Pack uint8 matrix to 2-bit
 cpdef void pack_genotypes(uintptr_t G_ptr, uintptr_t G_packed_ptr, Py_ssize_t M, Py_ssize_t N, Py_ssize_t M_bytes) noexcept nogil:
@@ -388,35 +317,49 @@ cdef void _parse_vcf_data_line(const char* line, uint8_t* row, Py_ssize_t n_samp
         elif line[pos] == 10 or line[pos] == 0:
             break
 
-# Pack 4 rows to 1 byte
-cdef void _pack_4rows_into_byte(
-    const uint8_t* buf,
-    uint8_t* packed_row,
-    Py_ssize_t N,
-    Py_ssize_t n_valid
-) noexcept nogil:
-    """
-    Description:
-    Packs up to 4 raw rows (uint8) into a single byte-per-individual row (2-bit).
-
-    Args:
-        buf (const uint8_t*): Buffer with raw row data.
-        packed_row (uint8_t*): Target row for packed genotypes.
-        N (Py_ssize_t): Number of individuals.
-        n_valid (Py_ssize_t): Number of valid rows in buf to pack.
-
-    Returns:
-        None
-    """
+cdef inline Py_ssize_t _vcf_first_sample_pos(const char* line) noexcept nogil:
     cdef:
-        Py_ssize_t i, k
+        Py_ssize_t pos = 0
+        Py_ssize_t field_count = 0
+        char c
+
+    while field_count < 9:
+        c = line[pos]
+        if c == 0 or c == 10:
+            return pos
+        if c == 9:
+            field_count += 1
+        pos += 1
+    return pos
+
+cdef inline void _skip_to_next_vcf_sample(const char* line, Py_ssize_t* pos) noexcept nogil:
+    cdef char c
+
+    while True:
+        c = line[pos[0]]
+        if c == 9 or c == 10 or c == 0:
+            break
+        pos[0] += 1
+
+    if line[pos[0]] == 9:
+        pos[0] += 1
+
+cdef void _parse_vcf_4lines_packed(const char** lines, Py_ssize_t base_idx, uint8_t* packed_row, Py_ssize_t n_samples, Py_ssize_t n_valid) noexcept nogil:
+    cdef:
+        Py_ssize_t pos[4]
+        Py_ssize_t sample_idx, k
         uint8_t byte_val, val
-    for i in range(N):
+
+    for k in range(n_valid):
+        pos[k] = _vcf_first_sample_pos(lines[base_idx + k])
+
+    for sample_idx in range(n_samples):
         byte_val = 0
         for k in range(n_valid):
-            val = buf[k * N + i] & 0x03
-            byte_val |= val << (k << 1)
-        packed_row[i] = byte_val
+            val = _parse_gt_field_direct(lines[base_idx + k], &pos[k])
+            byte_val |= (val & 0x03) << (k << 1)
+            _skip_to_next_vcf_sample(lines[base_idx + k], &pos[k])
+        packed_row[sample_idx] = byte_val
 
 # Process VCF chunk to uint8
 cdef void _process_chunk_standard(
@@ -453,8 +396,40 @@ cdef void _process_chunk_standard(
 
     free(c_lines)
 
+cdef inline bint _keep_chromosome_line(const char* line, bint keep_all, int autosome_count) noexcept:
+    cdef:
+        Py_ssize_t pos
+        Py_ssize_t start = 0
+        unsigned char c
+        int chrom_num = 0
+
+    if keep_all:
+        return True
+
+    if line[0] != 0 and line[1] != 0 and line[2] != 0:
+        if (
+            (line[0] == 99 or line[0] == 67)
+            and (line[1] == 104 or line[1] == 72)
+            and (line[2] == 114 or line[2] == 82)
+        ):
+            start = 3
+
+    pos = start
+    while True:
+        c = <unsigned char>line[pos]
+        if c == 9:
+            break
+        if c == 0 or c == 10 or c == 13:
+            return False
+        if c < 48 or c > 57:
+            return False
+        chrom_num = chrom_num * 10 + (c - 48)
+        pos += 1
+
+    return 1 <= chrom_num <= autosome_count
+
 # Read VCF to uint8 matrix
-def read_vcf_file(str filepath, int chunk_size):
+def read_vcf_file(str filepath, int chunk_size, str chromosome_mode, int autosome_count):
     """
     Description:
     Reads a VCF file (plain or gzip) into a uint8 NumPy matrix using a memory-efficient chunking strategy.
@@ -474,9 +449,14 @@ def read_vcf_file(str filepath, int chunk_size):
         Py_ssize_t n_variants = 0
         Py_ssize_t start_var_idx = 0
         Py_ssize_t skipped_variants = 0
+        bint keep_all = chromosome_mode == "all"
+
+    if chromosome_mode not in ("all", "autosomes"):
+        raise ValueError("chromosome_mode must be 'all' or 'autosomes'")
+    if autosome_count < 1:
+        raise ValueError("autosome_count must be at least 1")
 
     is_gz = filepath.endswith('.gz')
-    
     fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
     try:
         for line in fh:
@@ -485,14 +465,7 @@ def read_vcf_file(str filepath, int chunk_size):
                     parts = line.rstrip(b'\n').split(b'\t')
                     n_samples = len(parts) - 9
                 continue
-            # Filter non-numeric chromosomes
-            chrom = line.split(b'\t', 1)[0]
-            numeric_chrom = bytes([c for c in chrom if 48 <= c <= 57])
-            try:
-                if not numeric_chrom:
-                    raise ValueError()
-                int(numeric_chrom)
-            except ValueError:
+            if not _keep_chromosome_line(line, keep_all, autosome_count):
                 skipped_variants += 1
                 continue
             n_variants += 1
@@ -504,7 +477,7 @@ def read_vcf_file(str filepath, int chunk_size):
 
     if skipped_variants > 0:
         import logging
-        logging.getLogger(__name__).warning(f"        Warning: Skipped {skipped_variants} SNPs on non-numeric chromosomes (e.g. sex chromosomes).")
+        logging.getLogger(__name__).warning(f"        Warning: Skipped {skipped_variants} SNPs outside autosomes 1..{autosome_count}.")
 
     cdef uint8_t[:, ::1] G = np.empty((n_variants, n_samples), dtype=np.uint8)
 
@@ -516,27 +489,25 @@ def read_vcf_file(str filepath, int chunk_size):
             if line.startswith(b'#'):
                 continue
                 
-            chrom = line.split(b'\t', 1)[0]
-            numeric_chrom = bytes([c for c in chrom if 48 <= c <= 57])
-            try:
-                if not numeric_chrom:
-                    raise ValueError()
-                int(numeric_chrom)
-            except ValueError:
+            if not _keep_chromosome_line(line, keep_all, autosome_count):
                 continue
 
             chunk_bytes.append(line)
             
             if len(chunk_bytes) == chunk_size:
                 _process_chunk_standard(chunk_bytes, G, start_var_idx, n_samples)
-                start_var_idx += chunk_size
+                start_var_idx += len(chunk_bytes)
                 chunk_bytes = []
                 
         if chunk_bytes:
             _process_chunk_standard(chunk_bytes, G, start_var_idx, n_samples)
+            start_var_idx += len(chunk_bytes)
             
     finally:
         fh.close()
+
+    if start_var_idx != n_variants:
+        raise ValueError(f"VCF variant count mismatch: expected {n_variants}, parsed {start_var_idx}")
 
     return np.asarray(G), n_samples, n_variants
 
@@ -563,10 +534,9 @@ cdef void _process_chunk_packed(
     cdef:
         Py_ssize_t n_chunk = len(chunk_bytes)
         Py_ssize_t M_bytes_chunk = (n_chunk + 3) // 4
-        Py_ssize_t i, g, k, var_idx, n_valid
+        Py_ssize_t i, g, n_valid
         Py_ssize_t global_g
         const char** c_lines
-        uint8_t* local_buf
 
     c_lines = <const char**>malloc(n_chunk * sizeof(const char*))
     for i in range(n_chunk):
@@ -574,25 +544,18 @@ cdef void _process_chunk_packed(
 
     with nogil, parallel():
         for g in prange(M_bytes_chunk, schedule='guided'):
-            local_buf = <uint8_t*>malloc(4 * n_samples * sizeof(uint8_t))
             n_valid = 4
             
             if g * 4 + 4 > n_chunk:
                 n_valid = n_chunk - g * 4
-                
-            for k in range(n_valid):
-                var_idx = g * 4 + k
-                _parse_vcf_data_line(c_lines[var_idx], local_buf + k * n_samples, n_samples)
-                
+
             global_g = (start_var_idx // 4) + g
-            _pack_4rows_into_byte(local_buf, &G_packed[global_g, 0], n_samples, n_valid)
-            
-            free(local_buf)
+            _parse_vcf_4lines_packed(c_lines, g * 4, &G_packed[global_g, 0], n_samples, n_valid)
 
     free(c_lines)
 
 # Read VCF to 2-bit packed matrix
-def read_vcf_file_packed(str filepath, int chunk_size):
+def read_vcf_file_packed(str filepath, int chunk_size, str chromosome_mode, int autosome_count):
     """
     Description:
     Reads a VCF file directly into a 2-bit packed format optimized for GPU acceleration.
@@ -613,9 +576,14 @@ def read_vcf_file_packed(str filepath, int chunk_size):
         Py_ssize_t M_bytes
         Py_ssize_t start_var_idx = 0
         Py_ssize_t skipped_variants = 0
+        bint keep_all = chromosome_mode == "all"
+
+    if chromosome_mode not in ("all", "autosomes"):
+        raise ValueError("chromosome_mode must be 'all' or 'autosomes'")
+    if autosome_count < 1:
+        raise ValueError("autosome_count must be at least 1")
 
     is_gz = filepath.endswith('.gz')
-    
     fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
     try:
         for line in fh:
@@ -624,13 +592,7 @@ def read_vcf_file_packed(str filepath, int chunk_size):
                     parts = line.rstrip(b'\n').split(b'\t')
                     n_samples = len(parts) - 9
                 continue
-            chrom = line.split(b'\t', 1)[0]
-            numeric_chrom = bytes([c for c in chrom if 48 <= c <= 57])
-            try:
-                if not numeric_chrom:
-                    raise ValueError()
-                int(numeric_chrom)
-            except ValueError:
+            if not _keep_chromosome_line(line, keep_all, autosome_count):
                 skipped_variants += 1
                 continue
             n_variants += 1
@@ -642,7 +604,7 @@ def read_vcf_file_packed(str filepath, int chunk_size):
 
     if skipped_variants > 0:
         import logging
-        logging.getLogger(__name__).warning(f"        Warning: Skipped {skipped_variants} SNPs on non-numeric chromosomes (e.g. sex chromosomes).")
+        logging.getLogger(__name__).warning(f"        Warning: Skipped {skipped_variants} SNPs outside autosomes 1..{autosome_count}.")
 
     M_bytes = (n_variants + 3) // 4
     cdef uint8_t[:, ::1] G_packed = np.zeros((M_bytes, n_samples), dtype=np.uint8)
@@ -658,26 +620,24 @@ def read_vcf_file_packed(str filepath, int chunk_size):
             if line.startswith(b'#'):
                 continue
                 
-            chrom = line.split(b'\t', 1)[0]
-            numeric_chrom = bytes([c for c in chrom if 48 <= c <= 57])
-            try:
-                if not numeric_chrom:
-                    raise ValueError()
-                int(numeric_chrom)
-            except ValueError:
+            if not _keep_chromosome_line(line, keep_all, autosome_count):
                 continue
 
             chunk_bytes.append(line)
             
             if len(chunk_bytes) == chunk_size:
                 _process_chunk_packed(chunk_bytes, G_packed, start_var_idx, n_samples)
-                start_var_idx += chunk_size
+                start_var_idx += len(chunk_bytes)
                 chunk_bytes = []
                 
         if chunk_bytes:
             _process_chunk_packed(chunk_bytes, G_packed, start_var_idx, n_samples)
+            start_var_idx += len(chunk_bytes)
             
     finally:
         fh.close()
+
+    if start_var_idx != n_variants:
+        raise ValueError(f"VCF variant count mismatch: expected {n_variants}, parsed {start_var_idx}")
 
     return np.asarray(G_packed), n_samples, n_variants

@@ -86,6 +86,20 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument("--chunk_size",    type=int,   default=4096,   help="SNP chunk size for I/O (default: 4096).")
     parser.add_argument("--device",        type=str,   default="cpu",  help="Computation device: cpu, cuda, or mps (default: cpu).")
     parser.add_argument("--no_freqs",      action="store_true",        help="Do not save the P matrix.")
+    parser.add_argument(
+        "--chromosome-mode", "--chromosome_mode",
+        dest="chromosome_mode",
+        choices=["all", "autosomes"],
+        default="autosomes",
+        help="Chromosome filter for input variants: all or autosomes (default: autosomes).",
+    )
+    parser.add_argument(
+        "--autosome-count", "--autosome_count",
+        dest="autosome_count",
+        type=int,
+        default=22,
+        help="Number of autosomes kept when --chromosome-mode=autosomes (default: 22).",
+    )
 
     # ── Labels & plotting ──────────────────────────────────────────────────────
     parser.add_argument(
@@ -128,6 +142,8 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
                 parser.error(f"Invalid DPI value: {args.plot[1]}")
         assert args.plot_format in ["pdf", "png", "jpg"], "Plot format must be pdf, png or jpg."
         assert 50 <= args.plot_dpi <= 1200, "DPI must be between 50 and 1200."
+    if args.autosome_count < 1:
+        parser.error("--autosome-count must be at least 1.")
 
 
 
@@ -195,6 +211,12 @@ def main() -> None:
     For plotting, all three label levels are passed through as usual; the
     supervision labels (from ``--labels``, ``--labels2``, or ``--labels3``)
     serve simultaneously as plot labels at their corresponding level.
+
+    Args:
+        None.
+
+    Returns:
+        None
     """
 
     print_adamixture_banner(__version__)
@@ -270,7 +292,13 @@ def main() -> None:
     assert K >= 2, f"Number of populations K (derived from labels) must be at least 2, but got {K}."
 
     # ── Load genotype data ────────────────────────────────────────────────────
-    G, N, M = utils.read_data(args.data_path, packed=False, chunk_size=args.chunk_size)
+    G, N, M = utils.read_data(
+        args.data_path,
+        packed=False,
+        chunk_size=args.chunk_size,
+        chromosome_mode=args.chromosome_mode,
+        autosome_count=args.autosome_count,
+    )
 
     if N != len(y):
         log.error(
@@ -298,10 +326,40 @@ def main() -> None:
         device_obj = torch.device(device_str)
         threads_per_block = utils.get_tuning_params(device_obj)
         utils.load_extensions(device_obj)
-        G_t = torch.from_numpy(G) if not isinstance(G, torch.Tensor) else G
+        if device_obj.type == 'cuda':
+            previous_disable = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+            try:
+                G_t, N_t, M_t = utils.read_data(
+                    args.data_path,
+                    packed=True,
+                    chunk_size=args.chunk_size,
+                    chromosome_mode=args.chromosome_mode,
+                    autosome_count=args.autosome_count,
+                    verbose=False,
+                )
+            finally:
+                logging.disable(previous_disable)
+            if N_t != N or M_t != M:
+                raise ValueError(
+                    f"GPU reread shape mismatch: supervised data was N={N}, M={M}; "
+                    f"packed data is N={N_t}, M={M_t}."
+                )
+        else:
+            G_t = torch.from_numpy(G) if not isinstance(G, torch.Tensor) else G
         P_t = torch.tensor(P, dtype=utils.get_dtype(device_obj), device=device_obj)
         Q_t = torch.tensor(Q, dtype=utils.get_dtype(device_obj), device=device_obj)
-        G_t = utils.manage_gpu_memory(G_t, device_obj, M, N, K, args.chunk_size)
+        G_t = utils.manage_gpu_memory(
+            G_t,
+            device_obj,
+            M,
+            N,
+            K,
+            args.chunk_size,
+            args.algorithm,
+            args.Q_hist,
+            include_initialization=False,
+        )
         if args.algorithm == 'brqn':
             P_gpu, Q_gpu = optimize_supervised_original_gpu(
                 G=G_t, P=P_t, Q=Q_t, y=y,
@@ -352,6 +410,17 @@ def main() -> None:
         from .src.plot import plot_q_matrix
 
         def _load(path_str: str, flag_name: str) -> list[str] | None:
+            """
+            Description:
+            Loads labels or colors from an optional plot metadata file.
+
+            Args:
+                path_str (str): Path to the metadata file.
+                flag_name (str): CLI flag name used in warning messages.
+
+            Returns:
+                list[str] | None: Loaded strings, or None if the file is absent.
+            """
             p = Path(path_str)
             if not p.exists():
                 log.warning(f"    Warning: File specified in {flag_name} not found: {path_str}")
@@ -364,7 +433,7 @@ def main() -> None:
         colors  = _load(args.colors, "--colors") if args.colors else None
 
         plot_path = out_path / f"{args.name}.{K}.{args.plot_format}"
-        log.info(f"    Generating plot: {plot_path}")
+        log.info(f"    Generating plot: {plot_path.name}")
         plot_q_matrix(
             Q_opt, plot_path,
             dpi=args.plot_dpi, format=args.plot_format,

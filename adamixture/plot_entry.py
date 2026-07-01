@@ -12,6 +12,7 @@ from .src.plot import align_clusters_greedy
 
 # Global logging configuration
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 _MAX_LABEL_LEN = 25
@@ -97,6 +98,9 @@ def _draw_brackets(ax, items: list[dict], y_bracket: float, fontsize: int = 6) -
         items (list[dict]): List of dicts with 'name', 'start', 'end' keys (in sample-index space).
         y_bracket (float): Y position in axes-transform space for the bracket line.
         fontsize (int): Font size for the bracket labels.
+
+    Returns:
+        None
     """
     trans = ax.get_xaxis_transform()
     y_text = y_bracket - 0.05
@@ -183,6 +187,19 @@ def main() -> None:
     # Validate hierarchical consistency: each lower-level label must belong to
     # exactly one higher-level group (e.g. "Barcelona" → only "Spain", not also "France").
     def _check_hierarchy(child_lbls, parent_lbls, child_name, parent_name):
+        """
+        Description:
+        Checks that each child label maps to exactly one parent label.
+
+        Args:
+            child_lbls (list): Lower-level labels.
+            parent_lbls (list): Higher-level labels.
+            child_name (str): Name of the child label source for warning messages.
+            parent_name (str): Name of the parent label source for warning messages.
+
+        Returns:
+            bool: True when the hierarchy is consistent, otherwise False.
+        """
         mapping: dict = {}
         conflicts: list[str] = []
         for child, parent in zip(child_lbls, parent_lbls, strict=False):

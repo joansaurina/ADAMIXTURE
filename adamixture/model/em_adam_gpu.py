@@ -155,6 +155,22 @@ class EMAdamOptimizer:
     """
     def __init__(self, P_shape: torch.Size, Q_shape: torch.Size, lr: float, beta1: float, beta2: float,
                 reg_adam: float, device: torch.device) -> None:
+        """
+        Description:
+        Initializes Adam-EM optimizer state tensors and EM target buffers.
+
+        Args:
+            P_shape (torch.Size): Shape of the P tensor.
+            Q_shape (torch.Size): Shape of the Q tensor.
+            lr (float): Adam learning rate.
+            beta1 (float): Adam beta1.
+            beta2 (float): Adam beta2.
+            reg_adam (float): Adam epsilon.
+            device (torch.device): Device for optimizer buffers.
+
+        Returns:
+            None
+        """
         self.device = device
         self.lr = lr
         self.beta1 = beta1

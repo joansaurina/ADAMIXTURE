@@ -7,10 +7,10 @@ import torch
 
 from ..model.als import ALS
 from ..model.als_gpu import ALS_gpu
-from ..model.em_adam import emStep, optimize_parameters
-from ..model.em_adam_gpu import EMAdamOptimizer, optimize_parameters_gpu
 from ..model.br_qn import optimize_original
 from ..model.br_qn_gpu import optimize_original_gpu
+from ..model.em_adam import emStep, optimize_parameters
+from ..model.em_adam_gpu import EMAdamOptimizer, optimize_parameters_gpu
 from ..model.svd import RSVD
 from ..model.svd_gpu import SVD_gpu
 from . import utils
@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, power: int,
           tol_svd: float, chunk_size: int, device: str, original: bool = False,
-          init_original: str = 'em') -> tuple:
+          init_original: str = 'em', q_hist: int = 3) -> tuple:
     """
     Description:
     One-time initialisation shared across all K values in a sweep:
@@ -40,6 +40,7 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
         device (str): Target device string ('cpu', 'cuda', 'mps').
         original (bool): If True, run original ADMIXTURE after initialization.
         init_original (str): Initialization used by --original ('em' or 'als').
+        q_hist (int): ZAL-QN history depth used when original is True.
 
     Returns:
         tuple: (device_obj, threads_per_block, f, U, S, V, G) where G may
@@ -59,7 +60,17 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
 
     if original and init_original == 'em':
         if device_obj.type != 'cpu':
-            G = utils.manage_gpu_memory(G, device_obj, M, N, K_max, chunk_size)
+            G = utils.manage_gpu_memory(
+                G,
+                device_obj,
+                M,
+                N,
+                K_max,
+                chunk_size,
+                'brqn',
+                q_hist,
+                include_initialization=False,
+            )
         log.info("    Skipping SVD; --original uses random + EM initialization.\n")
         return device_obj, threads_per_block, None, None, None, None, G
 
@@ -70,7 +81,8 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
         log.info("    Running SVD...\n")
         U, S, V = RSVD(G, N, M, f, K_max, seed, power, tol_svd, chunk_size)
     else:
-        G = utils.manage_gpu_memory(G, device_obj, M, N, K_max, chunk_size)
+        algorithm = 'brqn' if original else 'adamem'
+        G = utils.manage_gpu_memory(G, device_obj, M, N, K_max, chunk_size, algorithm, q_hist)
 
         f = utils.calculate_frequencies_gpu(G, M, chunk_size, device_obj, threads_per_block)
         log.info("    Frequencies calculated.\n")
@@ -83,6 +95,21 @@ def setup(G: torch.Tensor | np.ndarray, N: int, M: int, K_max: int, seed: int, p
 
 def initialize_em_cpu(G: np.ndarray, seed: int, M: int, N: int, K: int,
                       n_steps: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Description:
+    Initializes P and Q randomly on CPU and runs a few EM priming steps.
+
+    Args:
+        G (np.ndarray): Genotype matrix (M x N, uint8).
+        seed (int): Random seed.
+        M (int): Number of SNPs.
+        N (int): Number of individuals.
+        K (int): Number of ancestral populations.
+        n_steps (int): Number of EM priming steps. Defaults to 5.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Initialized (P, Q) matrices.
+    """
     t0 = time.time()
     rng = np.random.default_rng(seed)
     P = rng.random(size=(M, K), dtype=np.float64)
@@ -96,7 +123,7 @@ def initialize_em_cpu(G: np.ndarray, seed: int, M: int, N: int, K: int,
     q_bat = np.zeros(N, dtype=np.float64)
 
     log.info(f"    Random initialization + {n_steps} EM initial steps...")
-    for i in range(n_steps):
+    for _ in range(n_steps):
         emStep(G, P, Q, T, P_next, Q_next, q_bat, K, M, N)
 
     log.info(f"        Total EM initialization time={time.time() - t0:.3f}s\n")
@@ -106,6 +133,24 @@ def initialize_em_cpu(G: np.ndarray, seed: int, M: int, N: int, K: int,
 def initialize_em_gpu(G: torch.Tensor, seed: int, M: int, N: int, K: int,
                       device_obj: torch.device, chunk_size: int, threads_per_block: int,
                       n_steps: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Description:
+    Initializes P and Q randomly on GPU and runs a few EM priming steps.
+
+    Args:
+        G (torch.Tensor): Packed genotype tensor.
+        seed (int): Random seed.
+        M (int): Number of SNPs.
+        N (int): Number of individuals.
+        K (int): Number of ancestral populations.
+        device_obj (torch.device): Computation device.
+        chunk_size (int): SNP chunk size for batched GPU work.
+        threads_per_block (int): CUDA tuning parameter.
+        n_steps (int): Number of EM priming steps. Defaults to 5.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Initialized (P, Q) tensors.
+    """
     t0 = time.time()
     dtype = utils.get_dtype(device_obj)
     rng = np.random.default_rng(seed)
@@ -121,7 +166,7 @@ def initialize_em_gpu(G: torch.Tensor, seed: int, M: int, N: int, K: int,
     unpacker = utils.get_unpacker(device_obj, threads_per_block)
 
     log.info(f"    Random initialization + {n_steps} EM initial steps...")
-    for i in range(n_steps):
+    for _ in range(n_steps):
         optimizer.run_em_step(G, P, Q, M, chunk_size, unpacker)
         P.copy_(optimizer.P_EM)
         Q.copy_(optimizer.Q_EM)

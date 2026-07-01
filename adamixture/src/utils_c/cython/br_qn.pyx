@@ -1,7 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 from cython.parallel import parallel, prange
 from libc.math cimport fabs, log
-from libc.stdint cimport uint8_t
+from libc.stdint cimport int32_t, uint8_t
 
 # ZAL Quasi-Newton: update U and V history matrices
 cpdef void update_UV_ZAL(double[::1] U_flat, double[::1] V_flat, const double[::1] x, const double[::1] x_next,
@@ -112,6 +112,103 @@ cpdef double deviance_squared_sum(uint8_t[::1] geno_values, long[::1] flat_entri
         Py_ssize_t K = Q.shape[1]
         Py_ssize_t i, k
         long idx
+        Py_ssize_t row, col
+        double g, mu, term_a, term_b, rem, dev
+        double total = 0.0
+        double eps = 1e-10
+
+    with nogil, parallel():
+        for i in prange(n_entries, schedule='guided'):
+            idx = flat_entries[i]
+            row = idx // N
+            col = idx % N
+            g = <double>geno_values[i]
+
+            mu = 0.0
+            for k in range(K):
+                mu = mu + Q[col, k] * P[row, k]
+            mu = 2.0 * mu
+
+            if mu < eps:
+                mu = eps
+            elif mu > 2.0 - eps:
+                mu = 2.0 - eps
+
+            term_a = 0.0
+            if g > 0.0:
+                term_a = g * log(g / mu)
+
+            rem = 2.0 - g
+            term_b = 0.0
+            if rem > 0.0:
+                term_b = rem * log(rem / (2.0 - mu))
+
+            dev = term_a + term_b
+            total += dev
+
+    return total
+
+cpdef void mask_entries_i32(uint8_t[:, ::1] G, int32_t[:] flat_entries, uint8_t[::1] saved_values, Py_ssize_t N) noexcept nogil:
+    cdef:
+        Py_ssize_t n_entries = flat_entries.shape[0]
+        Py_ssize_t i, row, col
+        int32_t idx
+
+    with nogil, parallel():
+        for i in prange(n_entries, schedule='guided'):
+            idx = flat_entries[i]
+            row = idx // N
+            col = idx % N
+            saved_values[i] = G[row, col]
+            G[row, col] = 3
+
+cpdef void restore_entries_i32(uint8_t[:, ::1] G, int32_t[:] flat_entries, uint8_t[::1] saved_values, Py_ssize_t N) noexcept nogil:
+    cdef:
+        Py_ssize_t n_entries = flat_entries.shape[0]
+        Py_ssize_t i, row, col
+        int32_t idx
+
+    with nogil, parallel():
+        for i in prange(n_entries, schedule='guided'):
+            idx = flat_entries[i]
+            row = idx // N
+            col = idx % N
+            G[row, col] = saved_values[i]
+
+cpdef void mask_entries_i64(uint8_t[:, ::1] G, long[:] flat_entries, uint8_t[::1] saved_values, Py_ssize_t N) noexcept nogil:
+    cdef:
+        Py_ssize_t n_entries = flat_entries.shape[0]
+        Py_ssize_t i, row, col
+        long idx
+
+    with nogil, parallel():
+        for i in prange(n_entries, schedule='guided'):
+            idx = flat_entries[i]
+            row = idx // N
+            col = idx % N
+            saved_values[i] = G[row, col]
+            G[row, col] = 3
+
+cpdef void restore_entries_i64(uint8_t[:, ::1] G, long[:] flat_entries, uint8_t[::1] saved_values, Py_ssize_t N) noexcept nogil:
+    cdef:
+        Py_ssize_t n_entries = flat_entries.shape[0]
+        Py_ssize_t i, row, col
+        long idx
+
+    with nogil, parallel():
+        for i in prange(n_entries, schedule='guided'):
+            idx = flat_entries[i]
+            row = idx // N
+            col = idx % N
+            G[row, col] = saved_values[i]
+
+cpdef double deviance_squared_sum_i32(uint8_t[::1] geno_values, int32_t[:] flat_entries, double[:,::1] P,
+                                      double[:,::1] Q, Py_ssize_t N) noexcept nogil:
+    cdef:
+        Py_ssize_t n_entries = flat_entries.shape[0]
+        Py_ssize_t K = Q.shape[1]
+        Py_ssize_t i, k
+        int32_t idx
         Py_ssize_t row, col
         double g, mu, term_a, term_b, rem, dev
         double total = 0.0

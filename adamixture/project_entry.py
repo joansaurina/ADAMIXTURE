@@ -77,6 +77,20 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument("-t", "--threads", type=int,   default=1,      help="Number of CPU threads (default: 1).")
     parser.add_argument("--chunk_size",    type=int,   default=4096,   help="SNP chunk size for I/O (default: 4096).")
     parser.add_argument("--device",        type=str,   default="cpu",  help="Computation device: cpu, cuda, or mps (default: cpu).")
+    parser.add_argument(
+        "--chromosome-mode", "--chromosome_mode",
+        dest="chromosome_mode",
+        choices=["all", "autosomes"],
+        default="autosomes",
+        help="Chromosome filter for input variants: all or autosomes (default: autosomes).",
+    )
+    parser.add_argument(
+        "--autosome-count", "--autosome_count",
+        dest="autosome_count",
+        type=int,
+        default=22,
+        help="Number of autosomes kept when --chromosome-mode=autosomes (default: 22).",
+    )
 
     # ── Plotting ──────────────────────────────────────────────────────────────
     parser.add_argument("--plot",    nargs="*",  default=[], help="Generate a plot after projection. Optional: [format] [dpi].")
@@ -100,6 +114,8 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
                 parser.error(f"Invalid DPI value: {args.plot[1]}")
         assert args.plot_format in ["pdf", "png", "jpg"], "Plot format must be pdf, png or jpg."
         assert 50 <= args.plot_dpi <= 1200, "DPI must be between 50 and 1200."
+    if args.autosome_count < 1:
+        parser.error("--autosome-count must be at least 1.")
 
     return args
 
@@ -112,6 +128,12 @@ def main() -> None:
     Loads a pre-trained P matrix and a target genotype dataset, then runs
     the Adam-EM projection loop (Q-only updates) to estimate ancestry
     proportions for the target samples.
+
+    Args:
+        None.
+
+    Returns:
+        None
     """
     import torch
 
@@ -190,7 +212,13 @@ def main() -> None:
     log.info(f"    P matrix loaded: {M_p} SNPs, K={K} populations.\n")
 
     # ── Load target genotype data ─────────────────────────────────────────────
-    G, N, M = utils.read_data(args.data_path, packed=False, chunk_size=args.chunk_size)
+    G, N, M = utils.read_data(
+        args.data_path,
+        packed=(device_str == "cuda"),
+        chunk_size=args.chunk_size,
+        chromosome_mode=args.chromosome_mode,
+        autosome_count=args.autosome_count,
+    )
 
     if M != M_p:
         log.error(
@@ -220,7 +248,17 @@ def main() -> None:
         G_t = torch.from_numpy(G) if not isinstance(G, torch.Tensor) else G
         P_t = torch.tensor(P, dtype=utils.get_dtype(device_obj), device=device_obj)
         Q_t = torch.tensor(Q, dtype=utils.get_dtype(device_obj), device=device_obj)
-        G_t = utils.manage_gpu_memory(G_t, device_obj, M, N, K, args.chunk_size)
+        G_t = utils.manage_gpu_memory(
+            G_t,
+            device_obj,
+            M,
+            N,
+            K,
+            args.chunk_size,
+            args.algorithm,
+            args.Q_hist,
+            include_initialization=False,
+        )
         if args.algorithm == 'brqn':
             Q_gpu = optimize_projection_original_gpu(
                 G=G_t, P=P_t, Q=Q_t,
@@ -264,6 +302,16 @@ def main() -> None:
         from .src.plot import plot_q_matrix
 
         def _load(path_str):
+            """
+            Description:
+            Loads non-empty lines from an optional plot metadata file.
+
+            Args:
+                path_str (str): Path to the metadata file.
+
+            Returns:
+                list[str] | None: Loaded strings, or None if the file is absent.
+            """
             p = Path(path_str)
             return [line.strip() for line in p.open() if line.strip()] if p.exists() else None
 
@@ -273,7 +321,7 @@ def main() -> None:
         colors  = _load(args.colors)  if args.colors  else None
 
         plot_path = out_path / f"{args.name}.{K}.{args.plot_format}"
-        log.info(f"    Generating plot: {plot_path}")
+        log.info(f"    Generating plot: {plot_path.name}")
         plot_q_matrix(
             Q_opt, plot_path,
             dpi=args.plot_dpi, format=args.plot_format,

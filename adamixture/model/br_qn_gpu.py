@@ -1,10 +1,10 @@
 import logging
 import sys
 import time
+
 import torch
 
 from ..src import utils
-from .em_adam_gpu import EMAdamOptimizer
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -13,6 +13,14 @@ def _flatten_PQ_gpu_inplace(P: torch.Tensor, Q: torch.Tensor, out: torch.Tensor)
     """
     Description:
     Flattens P and Q in-place into a pre-allocated 1-D parameter vector.
+
+    Args:
+        P (torch.Tensor): P tensor (M x K).
+        Q (torch.Tensor): Q tensor (N x K).
+        out (torch.Tensor): Pre-allocated flat output tensor.
+
+    Returns:
+        None
     """
     mk = P.numel()
     out[:mk].copy_(P.ravel())
@@ -62,6 +70,19 @@ def _grad_hess_q_chunk(
     Q: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Description:
+    Computes Q-side gradient and Hessian contributions for one genotype chunk.
+
+    Args:
+        G_chunk (torch.Tensor): Unpacked genotype chunk (chunk_size x N).
+        P_chunk (torch.Tensor): P rows matching the genotype chunk (chunk_size x K).
+        Q (torch.Tensor): Current Q tensor (N x K).
+        dtype (torch.dtype): Floating-point dtype for calculations.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Gradient and Hessian components.
+    """
     qp = torch.matmul(P_chunk, Q.T)
     qp = torch.clamp(qp, min=1e-10, max=1.0 - 1e-10)
 
@@ -89,6 +110,19 @@ def _grad_hess_p_chunk(
     Q: torch.Tensor,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Description:
+    Computes P-side gradient and Hessian contributions for one genotype chunk.
+
+    Args:
+        G_chunk (torch.Tensor): Unpacked genotype chunk (chunk_size x N).
+        P_chunk (torch.Tensor): P rows matching the genotype chunk (chunk_size x K).
+        Q (torch.Tensor): Current Q tensor (N x K).
+        dtype (torch.dtype): Floating-point dtype for calculations.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Gradient and Hessian components.
+    """
     qp = torch.matmul(P_chunk, Q.T)
     qp = torch.clamp(qp, min=1e-10, max=1.0 - 1e-10)
 
@@ -106,101 +140,6 @@ def _grad_hess_p_chunk(
 
 _grad_hess_q_chunk_compiled = torch.compile(_grad_hess_q_chunk, disable=not hasattr(torch, "compile"))
 _grad_hess_p_chunk_compiled = torch.compile(_grad_hess_p_chunk, disable=not hasattr(torch, "compile"))
-
-
-def polish_br_qn_gpu(G: torch.Tensor, P_init: torch.Tensor, Q_init: torch.Tensor,
-                    M: int, N: int, K: int, args,
-                    device: torch.device, threads_per_block: int,
-                    n_iters: int = 3, Q_hist: int = 3) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Description:
-    Polishes P and Q tensors on GPU using block-relaxation with ZAL quasi-Newton
-    acceleration. Designed for cross-validation fold polishing.
-
-    Args:
-        G (torch.Tensor): Genotype matrix with held-out entries masked as 3 (M_bytes x N, uint8).
-        P_init (torch.Tensor): Global P matrix (M x K) used as warm-start.
-        Q_init (torch.Tensor): Global Q matrix (N x K) used as warm-start.
-        M (int): Number of SNPs.
-        N (int): Number of individuals.
-        K (int): Number of ancestral populations.
-        args (Namespace): Parsed command-line arguments.
-        device (torch.device): Target computation device.
-        threads_per_block (int): Threads per block for GPU kernels.
-        n_iters (int): Number of QN iterations (default 3).
-        Q_hist (int): Number of QN history columns (default 3).
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Polished (P, Q) tensors.
-    """
-    P = P_init.clone()
-    Q = Q_init.clone()
-
-    # We use EMAdamOptimizer to reuse its accumulation buffers and EM logic,
-    # but we skip the Adam step and use pure EM updates.
-    optimizer = EMAdamOptimizer(P.shape, Q.shape, 0.0, 0.0, 0.0, 0.0, device)
-    unpacker = utils.get_unpacker(device, threads_per_block)
-    chunk_size = int(args.chunk_size)
-
-    dim = M * K + N * K
-    U = torch.zeros((dim, Q_hist), dtype=P.dtype, device=device)
-    V = torch.zeros((dim, Q_hist), dtype=P.dtype, device=device)
-    UV_diff = torch.zeros((dim, Q_hist), dtype=P.dtype, device=device)
-    x_buf = torch.empty(dim, dtype=P.dtype, device=device)
-    x_next_buf = torch.empty(dim, dtype=P.dtype, device=device)
-    x_next2_buf = torch.empty(dim, dtype=P.dtype, device=device)
-    x_qn = torch.empty(dim, dtype=P.dtype, device=device)
-
-    for it in range(1, n_iters + 1):
-        # --- Block-relaxation step 1: (P, Q) -> (P1, Q1) ---
-        P1_EM, Q1_EM = optimizer.run_em_step(G, P, Q, M, chunk_size, unpacker)
-        P1 = P1_EM.clone()
-        Q1 = Q1_EM.clone()
-
-        # --- Block-relaxation step 2: (P1, Q1) -> (P2, Q2) ---
-        P2_EM, Q2_EM = optimizer.run_em_step(G, P1, Q1, M, chunk_size, unpacker)
-        P2 = P2_EM.clone()
-        Q2 = Q2_EM.clone()
-
-        # --- Flatten for QN ---
-        _flatten_PQ_gpu_inplace(P, Q, x_buf)
-        _flatten_PQ_gpu_inplace(P1, Q1, x_next_buf)
-        _flatten_PQ_gpu_inplace(P2, Q2, x_next2_buf)
-
-        # --- Update UV history ---
-        col = (it - 1) % Q_hist
-        torch.sub(x_next_buf, x_buf, out=U[:, col])
-        torch.sub(x_next2_buf, x_next_buf, out=V[:, col])
-
-        # --- QN extrapolation ---
-        n_cols = min(it, Q_hist)
-        U_sub = U[:, :n_cols]
-        V_sub = V[:, :n_cols]
-
-        # Linear system: (U^T @ (U - V)) alpha = U^T @ (x - x_next)
-        torch.sub(U_sub, V_sub, out=UV_diff[:, :n_cols])
-        LHS = U_sub.T @ UV_diff[:, :n_cols]
-
-        torch.sub(x_buf, x_next_buf, out=x_qn)
-        RHS = U_sub.T @ x_qn
-
-        try:
-            # Solve the tiny (Q_hist x Q_hist) system
-            alpha = torch.linalg.solve(LHS, RHS)
-        except RuntimeError:
-            # Fallback if the system is singular/ill-conditioned
-            alpha = torch.linalg.lstsq(LHS, RHS).solution
-
-        # x_qn = x_next_buf - V_sub @ alpha
-        torch.matmul(V_sub, alpha, out=x_qn)
-        torch.sub(x_next_buf, x_qn, out=x_qn)
-
-        # --- Unflatten and project ---
-        _unflatten_PQ_gpu(x_qn, P, Q, M, K)
-        _mapPQ_compiled(P, Q)
-
-    del optimizer, U, V, UV_diff, x_buf, x_next_buf, x_next2_buf, x_qn
-    return P, Q
 
 
 def compute_grad_hess_Q_gpu(G: torch.Tensor, Q: torch.Tensor, P: torch.Tensor,
@@ -304,14 +243,14 @@ def optimize_original_gpu(G: torch.Tensor, P: torch.Tensor, Q: torch.Tensor, max
     ones_K = torch.ones((1, K), dtype=torch.float64, device=device)
     _, _, vt = torch.linalg.svd(ones_K, full_matrices=True)
     v_kk = vt.t().contiguous()
-    
+
     # 2. Allocate buffers on GPU
     dtype = utils.get_dtype(device)
     XtX_q = torch.zeros((N, K, K), dtype=torch.float64, device=device)
     Xtz_q = torch.zeros((N, K), dtype=torch.float64, device=device)
     XtX_p = torch.zeros((M, K, K), dtype=torch.float64, device=device)
     Xtz_p = torch.zeros((M, K), dtype=torch.float64, device=device)
-    
+
     # QN history buffers
     dim = M * K + N * K
     U = torch.zeros((dim, Q_hist), dtype=torch.float64, device=device)
@@ -319,78 +258,78 @@ def optimize_original_gpu(G: torch.Tensor, P: torch.Tensor, Q: torch.Tensor, max
     UV_diff = torch.zeros((dim, Q_hist), dtype=torch.float64, device=device)
     P_qn = torch.empty_like(P)
     Q_qn = torch.empty_like(Q)
-    
+
     # Pre-allocated buffers for ZAL QN acceleration
     x_qn = torch.empty(dim, dtype=torch.float64, device=device)
     x_buf = torch.empty(dim, dtype=torch.float64, device=device)
     x_next_buf = torch.empty(dim, dtype=torch.float64, device=device)
     x_next2_buf = torch.empty(dim, dtype=torch.float64, device=device)
-    
+
     unpacker = utils.get_unpacker(device, threads_per_block)
     logl_calc = utils.get_logl_calculator(device)
-    
+
     # --- Initialize log-likelihood ---
     ll_prev_iter = -float('inf')
     ll_best = -float("inf")
     P_best = torch.empty_like(P)
     Q_best = torch.empty_like(Q)
-    
+
     for it in range(1, max_iter + 1):
         it_start = time.time()
-        
+
         # --- SQP Update 1: (P, Q) -> (P_next, Q_next) ---
         compute_grad_hess_Q_gpu(G, Q, P, XtX_q, Xtz_q, M, chunk_size, unpacker, dtype)
         Xtz_q.neg_()
         Q_next = torch.ops.sqp_kernel.sqp_solve_q_cuda(XtX_q, Xtz_q, Q, v_kk, N, K)
-        
+
         compute_grad_hess_P_gpu(G, Q_next, P, XtX_p, Xtz_p, M, chunk_size, unpacker, dtype)
         Xtz_p.neg_()
         P_next = torch.ops.sqp_kernel.sqp_solve_p_cuda(XtX_p, Xtz_p, P, M, K)
-        
+
         # --- SQP Update 2: (P_next, Q_next) -> (P_next2, Q_next2) ---
         compute_grad_hess_Q_gpu(G, Q_next, P_next, XtX_q, Xtz_q, M, chunk_size, unpacker, dtype)
         Xtz_q.neg_()
         Q_next2 = torch.ops.sqp_kernel.sqp_solve_q_cuda(XtX_q, Xtz_q, Q_next, v_kk, N, K)
-        
+
         compute_grad_hess_P_gpu(G, Q_next2, P_next, XtX_p, Xtz_p, M, chunk_size, unpacker, dtype)
         Xtz_p.neg_()
         P_next2 = torch.ops.sqp_kernel.sqp_solve_p_cuda(XtX_p, Xtz_p, P_next, M, K)
-        
+
         # --- ZAL QN acceleration ---
         _flatten_PQ_gpu_inplace(P, Q, x_buf)
         _flatten_PQ_gpu_inplace(P_next, Q_next, x_next_buf)
         _flatten_PQ_gpu_inplace(P_next2, Q_next2, x_next2_buf)
-        
+
         col = (it - 1) % Q_hist
         torch.sub(x_next_buf, x_buf, out=U[:, col])
         torch.sub(x_next2_buf, x_next_buf, out=V[:, col])
-        
+
         n_cols = min(it, Q_hist)
         U_sub = U[:, :n_cols]
         V_sub = V[:, :n_cols]
-        
+
         torch.sub(U_sub, V_sub, out=UV_diff[:, :n_cols])
         LHS = U_sub.T @ UV_diff[:, :n_cols]
-        
+
         torch.sub(x_buf, x_next_buf, out=x_qn)
         RHS = U_sub.T @ x_qn
-        
+
         try:
             alpha = torch.linalg.solve(LHS, RHS)
         except RuntimeError:
             alpha = torch.linalg.lstsq(LHS, RHS).solution
-            
+
         # x_qn = x_next_buf - V_sub @ alpha
         torch.matmul(V_sub, alpha, out=x_qn)
         torch.sub(x_next_buf, x_qn, out=x_qn)
-        
+
         _unflatten_PQ_gpu(x_qn, P_qn, Q_qn, M, K)
-        
+
         _mapPQ_gpu(P_qn, Q_qn)
-        
+
         # --- Conditional QN Acceptance ---
         ll_qn = logl_calc(G, P_qn, Q_qn, M, N, chunk_size, threads_per_block)
-        
+
         if ll_qn > ll_prev_iter:
             P.copy_(P_qn)
             Q.copy_(Q_qn)
@@ -410,13 +349,13 @@ def optimize_original_gpu(G: torch.Tensor, P: torch.Tensor, Q: torch.Tensor, max
             f"Log-likelihood: {ll_new:.1f}, "
             f"Time: {time.time() - it_start:.3f}s"
         )
-        
+
         diff = ll_new - ll_prev_iter
-        if 0 <= diff < tol:
+        if abs(diff) < tol:
             log.info(f"    Converged at iteration {it}.")
             break
-            
+
         ll_prev_iter = ll_new
-        
+
     log.info(f"\n    Final log-likelihood: {ll_best:.1f}")
     return P_best, Q_best

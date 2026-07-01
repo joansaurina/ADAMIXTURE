@@ -52,6 +52,20 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument('--name', required=True, type=str, help='Experiment/model name.')
     parser.add_argument('-t', '--threads', required=False, default=1, type=int, help='Number of threads to be used in the execution (default: 1).')
     parser.add_argument('--device', required=False, default='cpu', choices=['cpu', 'gpu', 'mps'], help='Device to use (cpu, gpu, mps) (default: cpu).')
+    parser.add_argument(
+        '--chromosome-mode', '--chromosome_mode',
+        dest='chromosome_mode',
+        choices=['all', 'autosomes'],
+        default='autosomes',
+        help='Chromosome filter for input variants: all or autosomes (default: autosomes).',
+    )
+    parser.add_argument(
+        '--autosome-count', '--autosome_count',
+        dest='autosome_count',
+        type=int,
+        default=22,
+        help='Number of autosomes kept when --chromosome-mode=autosomes (default: 22).',
+    )
 
     parser.add_argument('--max_iter', type=int, default=10000, help='Maximum number of iterations for Adam EM (default: 10000).')
     parser.add_argument('--check', type=int, default=5, help='Frequency of log-likelihood checks (default: 5).')
@@ -63,7 +77,6 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
     parser.add_argument('--tol_svd', type=float, default=1e-1, help='Convergence tolerance for SVD (default: 1e-1).')
     parser.add_argument('--chunk_size', type=int, default=8192, help='Number of SNPs in chunk operations for SVD (default: 8192).')
     parser.add_argument('--cv', nargs='?', const=5, default=0, type=int, help='Enable v-fold cross-validation on genotype entries (default: 5).')
-
     parser.add_argument('--plot', nargs='*', help='Generate a single combined plot of all Q matrices across the K sweep (Optional: [format] [resolution]) (default: png 300).')
     parser.add_argument('--plot_single', nargs='*', help='Generate individual plots for each K in the sweep (Optional: [format] [resolution]) (default: png 300).')
     parser.add_argument('--labels', type=str, help='Path to population labels file (level 1, one label per sample).')
@@ -125,6 +138,8 @@ def parse_args(argv: list[str]) -> configargparse.Namespace:
         parser.error("--tol must be greater than 0.")
     if args.Q_hist < 1:
         parser.error("--Q_hist must be at least 1.")
+    if args.autosome_count < 1:
+        parser.error("--autosome-count must be at least 1.")
 
     return args
 
@@ -160,12 +175,19 @@ def print_adamixture_banner(version: str = "1.0") -> None:
 
 def _fix_macos_libomp() -> None:
     """
+    Description:
     On macOS, PyTorch ships its own libomp.dylib which conflicts with
     the Homebrew libomp used by our Cython extensions. Two different OpenMP
     runtimes loaded simultaneously cause segfaults with multiple threads.
 
     Fix: replace torch's libomp with a symlink to Homebrew's so both
     torch and our extensions use exactly the same OpenMP runtime.
+
+    Args:
+        None.
+
+    Returns:
+        None
     """
     if platform.system() != "Darwin":
         return

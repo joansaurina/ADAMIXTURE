@@ -1,3 +1,4 @@
+import gc
 import logging
 import sys
 from argparse import Namespace
@@ -6,34 +7,142 @@ import numpy as np
 import torch
 
 from ..model.br_qn import polish_br_qn
-from ..model.br_qn_gpu import polish_br_qn_gpu
-from . import utils
-from .utils_c import deviance_squared_sum
+from .utils_c import (
+    deviance_squared_sum,
+    deviance_squared_sum_i32,
+    mask_entries_i32,
+    mask_entries_i64,
+    restore_entries_i32,
+    restore_entries_i64,
+)
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
-def _build_folds(non_missing_flat: np.ndarray, n_folds: int, seed: int) -> list[np.ndarray]:
+_STREAMING_CV_TARGET_ENTRIES = 10_000_000
+_HASH_CONST_1 = np.uint64(0x9E3779B97F4A7C15)
+_HASH_CONST_2 = np.uint64(0xBF58476D1CE4E5B9)
+_HASH_CONST_3 = np.uint64(0x94D049BB133111EB)
+
+
+def _shuffle_non_missing(non_missing_flat: np.ndarray, seed: int) -> np.ndarray:
     """
     Description:
-    Partitions non-missing genotype flat indices into v roughly equal folds
-    using a random shuffle.
+    Returns a shuffled copy of non-missing genotype flat indices.
 
     Args:
         non_missing_flat (np.ndarray): 1-D array of flat indices where genotype != 3.
-        n_folds (int): Number of cross-validation folds.
         seed (int): Random seed for reproducibility.
 
     Returns:
-        list[np.ndarray]: List of v arrays, each containing the flat indices for one fold.
+        np.ndarray: Shuffled flat indices.
     """
     rng = np.random.default_rng(seed)
     shuffled = non_missing_flat.copy()
     rng.shuffle(shuffled)
+    return shuffled
 
-    fold_ids = np.arange(shuffled.size, dtype=np.int32) % n_folds
-    folds = [shuffled[fold_ids == fold] for fold in range(n_folds)]
-    return folds
+def _streaming_rows_per_chunk(N: int) -> int:
+    """
+    Description:
+    Returns the number of genotype rows to scan per streaming CV chunk.
+
+    Args:
+        N (int): Number of individuals.
+
+    Returns:
+        int: Number of SNP rows per chunk.
+    """
+    return max(1, _STREAMING_CV_TARGET_ENTRIES // N)
+
+def _hash_fold_mask(flat_entries: np.ndarray, seed: int, n_folds: int, fold: int) -> np.ndarray:
+    """
+    Description:
+    Returns a boolean mask selecting entries assigned to one CV fold by a deterministic hash.
+
+    Args:
+        flat_entries (np.ndarray): 1-D array of flat genotype indices.
+        seed (int): Random seed used to change the deterministic fold assignment.
+        n_folds (int): Number of cross-validation folds.
+        fold (int): Fold index to select.
+
+    Returns:
+        np.ndarray: Boolean mask indicating which entries belong to the requested fold.
+    """
+    hashed = flat_entries.astype(np.uint64, copy=False) + np.uint64(seed) + _HASH_CONST_1
+    hashed ^= hashed >> np.uint64(30)
+    hashed *= _HASH_CONST_2
+    hashed ^= hashed >> np.uint64(27)
+    hashed *= _HASH_CONST_3
+    hashed ^= hashed >> np.uint64(31)
+    return (hashed % np.uint64(n_folds)) == np.uint64(fold)
+
+def _iter_non_missing_flat_chunks(G: np.ndarray, N: int):
+    """
+    Description:
+    Yields chunks of non-missing genotype flat indices without materializing all entries.
+
+    Args:
+        G (np.ndarray): Unpacked genotype matrix (M x N, uint8).
+        N (int): Number of individuals.
+
+    Returns:
+        Iterator[np.ndarray]: Chunks of flat indices where genotype != 3.
+    """
+    rows_per_chunk = _streaming_rows_per_chunk(N)
+    for row_start in range(0, G.shape[0], rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, G.shape[0])
+        local = np.flatnonzero(G[row_start:row_end].ravel() != 3)
+        if local.size:
+            yield local.astype(np.int64, copy=False) + row_start * N
+
+def _count_non_missing_streaming(G: np.ndarray, N: int) -> int:
+    """
+    Description:
+    Counts non-missing genotype entries by scanning the matrix in chunks.
+
+    Args:
+        G (np.ndarray): Unpacked genotype matrix (M x N, uint8).
+        N (int): Number of individuals.
+
+    Returns:
+        int: Number of genotype entries where genotype != 3.
+    """
+    rows_per_chunk = _streaming_rows_per_chunk(N)
+    total = 0
+    for row_start in range(0, G.shape[0], rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, G.shape[0])
+        total += int(np.count_nonzero(G[row_start:row_end] != 3))
+    return total
+
+def _build_hashed_fold_entries(G: np.ndarray, N: int, n_folds: int, fold: int, seed: int) -> np.ndarray:
+    """
+    Description:
+    Builds the held-out flat indices for one CV fold using streaming deterministic hashing.
+
+    Args:
+        G (np.ndarray): Unpacked genotype matrix (M x N, uint8).
+        N (int): Number of individuals.
+        n_folds (int): Number of cross-validation folds.
+        fold (int): Fold index to build.
+        seed (int): Random seed used to change the deterministic fold assignment.
+
+    Returns:
+        np.ndarray: Flat genotype indices assigned to the requested fold.
+    """
+    n_fold_entries = 0
+    for flat_entries in _iter_non_missing_flat_chunks(G, N):
+        n_fold_entries += int(np.count_nonzero(_hash_fold_mask(flat_entries, seed, n_folds, fold)))
+
+    held_out_entries = np.empty(n_fold_entries, dtype=np.int64)
+    offset = 0
+    for flat_entries in _iter_non_missing_flat_chunks(G, N):
+        selected = flat_entries[_hash_fold_mask(flat_entries, seed, n_folds, fold)]
+        next_offset = offset + selected.size
+        held_out_entries[offset:next_offset] = selected
+        offset = next_offset
+
+    return held_out_entries
 
 def _polish_fold(G: np.ndarray, P_init: np.ndarray, Q_init: np.ndarray,
                 M: int, N: int, K: int) -> tuple[np.ndarray, np.ndarray]:
@@ -67,112 +176,6 @@ def _polish_fold(G: np.ndarray, P_init: np.ndarray, Q_init: np.ndarray,
         coeff_workspace=coeff_workspace
     )
 
-def _polish_fold_gpu(G: torch.Tensor, P_init: torch.Tensor, Q_init: torch.Tensor,
-                    args: Namespace, M: int, N: int, K: int,
-                    device: torch.device, threads_per_block: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Description:
-    Runs a fixed number of block-relaxation + ZAL quasi-Newton polishing
-    iterations on GPU, warm-started from the global P and Q estimates.
-    Operates on packed genotype data using chunked unpacking.
-
-    Args:
-        G (torch.Tensor): Packed genotype tensor on GPU (M_bytes x N, uint8).
-        P_init (torch.Tensor): Global P tensor (M x K) on GPU, used as warm-start.
-        Q_init (torch.Tensor): Global Q tensor (N x K) on GPU, used as warm-start.
-        args (Namespace): Parsed command-line arguments.
-        M (int): Number of SNPs.
-        N (int): Number of individuals.
-        K (int): Number of ancestral populations.
-        device (torch.device): CUDA device.
-        threads_per_block (int): CUDA threads per block for unpacking.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Polished (P, Q) tensors on GPU.
-    """
-    return polish_br_qn_gpu(
-        G, P_init, Q_init, M, N, K, args,
-        device, threads_per_block,
-        n_iters=3
-    )
-
-def _deviance_squared_sum_gpu(saved_values: torch.Tensor, held_out_entries: torch.Tensor,
-                            P: torch.Tensor, Q: torch.Tensor, N: int,
-                            chunk_size: int = 1_000_000) -> float:
-    """
-    Description:
-    Computes the sum of squared binomial deviance residuals entirely on GPU.
-    Processes entries in chunks to limit peak memory.
-
-    Args:
-        saved_values (torch.Tensor): 1-D uint8 tensor of original genotype values on GPU.
-        held_out_entries (torch.Tensor): 1-D int64 tensor of flat indices on GPU.
-        P (torch.Tensor): Polished P tensor (M x K) on GPU.
-        Q (torch.Tensor): Polished Q tensor (N x K) on GPU.
-        N (int): Number of individuals.
-        chunk_size (int): Entries per chunk to bound memory usage.
-
-    Returns:
-        float: Sum of squared deviance residuals.
-    """
-    eps = 1e-10
-    total = torch.tensor(0.0, dtype=torch.float64, device=P.device)
-    P64 = P.to(torch.float64)
-    Q64 = Q.to(torch.float64)
-    n_entries = held_out_entries.size(0)
-
-    for start in range(0, n_entries, chunk_size):
-        end = min(start + chunk_size, n_entries)
-        idx = held_out_entries[start:end]
-        rows = idx // N
-        cols = idx % N
-        g = saved_values[start:end].to(torch.float64)
-
-        mu = 2.0 * (P64[rows] * Q64[cols]).sum(dim=1)
-        torch.clamp_(mu, eps, 2.0 - eps)
-
-        term_a = torch.where(g > 0.0, g * torch.log(g / mu), torch.zeros_like(g))
-        rem = 2.0 - g
-        term_b = torch.where(rem > 0.0, rem * torch.log(rem / (2.0 - mu)), torch.zeros_like(g))
-
-        dev = term_a + term_b
-        total += dev.sum()
-
-    return total.item()
-
-def _find_non_missing_packed(G: torch.Tensor, M: int, N: int, device: torch.device,
-                            threads_per_block: int, chunk_size: int) -> np.ndarray:
-    """
-    Description:
-    Scans a packed genotype tensor in chunks to find all non-missing
-    (value != 3) flat indices in the M x N unpacked space.
-
-    Args:
-        G (torch.Tensor): Packed genotype tensor (M_bytes x N, uint8).
-        M (int): Number of SNPs.
-        N (int): Number of individuals.
-        device (torch.device): CUDA device.
-        threads_per_block (int): CUDA threads per block for unpacking.
-        chunk_size (int): Number of SNPs per unpacking chunk.
-
-    Returns:
-        np.ndarray: Sorted 1-D int64 array of flat indices where genotype != 3.
-    """
-    unpacker = utils.get_unpacker(device, threads_per_block)
-    scan_chunk = min(chunk_size, 512)
-    parts: list[np.ndarray] = []
-
-    for m_start in range(0, M, scan_chunk):
-        actual = min(scan_chunk, M - m_start)
-        chunk_gpu = unpacker(G, m_start, actual, M)
-        chunk_cpu = chunk_gpu.cpu().numpy()
-        del chunk_gpu
-        local_flat = np.flatnonzero(chunk_cpu.ravel() != 3)
-        if local_flat.size > 0:
-            parts.append((local_flat + m_start * N).astype(np.int64))
-
-    return np.concatenate(parts) if parts else np.array([], dtype=np.int64)
-
 def run_cross_validation(args: Namespace, G: np.ndarray, N: int, M: int, K: int,
                         P_global: np.ndarray | torch.Tensor, Q_global: np.ndarray | torch.Tensor) -> float:
     """
@@ -203,88 +206,70 @@ def run_cross_validation(args: Namespace, G: np.ndarray, N: int, M: int, K: int,
     if G.shape != (M, N):
         raise ValueError(f"CV requires an unpacked genotype matrix with shape {(M, N)}, got {G.shape}.")
 
-    non_missing_flat = np.flatnonzero(G != 3)
-    n_non_missing = int(non_missing_flat.size)
+    n_folds = int(args.cv)
+    use_streaming_folds = M * N > np.iinfo(np.int32).max
+    if use_streaming_folds:
+        n_non_missing = _count_non_missing_streaming(G, N)
+        shuffled = None
+    else:
+        non_missing_flat = np.flatnonzero(G != 3)
+        n_non_missing = int(non_missing_flat.size)
+        non_missing_flat = non_missing_flat.astype(np.int32, copy=False)
+        shuffled = _shuffle_non_missing(non_missing_flat, int(args.seed))
+        del non_missing_flat
+        gc.collect()
+
     if n_non_missing == 0:
         raise ValueError("No non-missing genotypes available for cross-validation.")
 
-    n_folds = int(args.cv)
-    folds = _build_folds(non_missing_flat, n_folds, int(args.seed))
-
     cv_sum = 0.0
-    for held_out_entries in folds:
+    for fold in range(n_folds):
+        if use_streaming_folds:
+            held_out_entries = _build_hashed_fold_entries(G, N, n_folds, fold, int(args.seed))
+        else:
+            held_out_entries = shuffled[fold::n_folds]
         if held_out_entries.size == 0:
+            if use_streaming_folds:
+                del held_out_entries
             continue
 
-        rows = held_out_entries // N
-        cols = held_out_entries % N
+        if held_out_entries.dtype == np.int32:
+            saved_values = np.empty(held_out_entries.size, dtype=np.uint8)
+            mask_entries_i32(G, held_out_entries, saved_values, N)
+            try:
+                P_cv, Q_cv = _polish_fold(G, P_global, Q_global, M, N, K)
+            finally:
+                restore_entries_i32(G, held_out_entries, saved_values, N)
 
-        saved_values = G[rows, cols].copy()
-        G[rows, cols] = 3
+            fold_sum = deviance_squared_sum_i32(
+                saved_values,
+                held_out_entries,
+                np.ascontiguousarray(P_cv, dtype=np.float64),
+                np.ascontiguousarray(Q_cv, dtype=np.float64),
+                N,
+            )
+            cv_sum += fold_sum
+            del saved_values, P_cv, Q_cv
+        else:
+            saved_values = np.empty(held_out_entries.size, dtype=np.uint8)
+            mask_entries_i64(G, held_out_entries, saved_values, N)
+            try:
+                P_cv, Q_cv = _polish_fold(G, P_global, Q_global, M, N, K)
+            finally:
+                restore_entries_i64(G, held_out_entries, saved_values, N)
 
-        P_cv, Q_cv = _polish_fold(G, P_global, Q_global, M, N, K)
-
-        G[rows, cols] = saved_values
-
-        fold_sum = deviance_squared_sum(
-            np.ascontiguousarray(saved_values, dtype=np.uint8),
-            np.ascontiguousarray(held_out_entries, dtype=np.int64),
-            np.ascontiguousarray(P_cv, dtype=np.float64),
-            np.ascontiguousarray(Q_cv, dtype=np.float64),
-            N,
-        )
-        cv_sum += fold_sum
-
-    cv_index = cv_sum / float(n_non_missing)
-    return cv_index
-
-def run_cross_validation_gpu(args: Namespace, G: torch.Tensor, N: int, M: int,
-                            P_global: torch.Tensor, Q_global: torch.Tensor,
-                            device: torch.device, threads_per_block: int) -> float:
-    """
-    Description:
-    Performs v-fold cross-validation directly on the packed GPU genotype tensor.
-    Held-out entries are masked/restored in-place via CUDA kernels operating on
-    2-bit packed bytes, avoiding any full unpacked copy of G. All computation
-    (masking, polishing, scoring) stays on GPU.
-
-    Args:
-        args (Namespace): Parsed command-line arguments.
-        G (torch.Tensor): Packed genotype tensor on GPU (M_bytes x N, uint8).
-        N (int): Number of individuals.
-        M (int): Number of SNPs.
-    Returns:
-        float: CV index (average squared deviance residual across all held-out entries).
-    """
-    chunk_size = int(args.chunk_size)
-
-    non_missing_flat = _find_non_missing_packed(G, M, N, device, threads_per_block, chunk_size)
-    n_non_missing = int(non_missing_flat.size)
-    if n_non_missing == 0:
-        raise ValueError("No non-missing genotypes available for cross-validation.")
-
-    n_folds = int(args.cv)
-    folds = _build_folds(non_missing_flat, n_folds, int(args.seed))
-    del non_missing_flat
-
-    cv_sum = 0.0
-    for held_out_entries in folds:
-        if held_out_entries.size == 0:
-            continue
-
-        held_out_gpu = torch.from_numpy(np.ascontiguousarray(held_out_entries, dtype=np.int64)).to(device)
-
-        saved_values_gpu = torch.ops.cv_mask_kernel.mask_entries_packed_cuda(G, held_out_gpu, N)
-
-        try:
-            K = P_global.shape[1]
-            P_cv, Q_cv = _polish_fold_gpu(G, P_global, Q_global, args, M, N, K, device, threads_per_block)
-        finally:
-            torch.ops.cv_mask_kernel.restore_entries_packed_cuda(G, held_out_gpu, saved_values_gpu, N)
-
-        fold_sum = _deviance_squared_sum_gpu(saved_values_gpu, held_out_gpu, P_cv, Q_cv, N)
-        del saved_values_gpu, held_out_gpu, P_cv, Q_cv
-        cv_sum += fold_sum
+            fold_sum = deviance_squared_sum(
+                saved_values,
+                held_out_entries,
+                np.ascontiguousarray(P_cv, dtype=np.float64),
+                np.ascontiguousarray(Q_cv, dtype=np.float64),
+                N,
+            )
+            cv_sum += fold_sum
+            del saved_values, P_cv, Q_cv
+        if use_streaming_folds:
+            del held_out_entries
+        gc.collect()
 
     cv_index = cv_sum / float(n_non_missing)
     return cv_index

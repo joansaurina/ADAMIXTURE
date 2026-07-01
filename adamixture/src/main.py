@@ -1,4 +1,5 @@
 import argparse
+import gc
 import logging
 import sys
 import time
@@ -37,7 +38,14 @@ def main(args: argparse.Namespace, t0: float) -> int:
 
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-        G, N, M = utils.read_data(args.data_path, packed='cuda' in args.device, chunk_size=args.chunk_size)
+        training_packed = args.device == 'gpu' or 'cuda' in args.device
+        G, N, M = utils.read_data(
+            args.data_path,
+            packed=training_packed,
+            chunk_size=args.chunk_size,
+            chromosome_mode=args.chromosome_mode,
+            autosome_count=args.autosome_count,
+        )
 
         K_max = max(k_values)
         device_obj, threads_per_block, f, U, S, V, G = setup(
@@ -45,6 +53,7 @@ def main(args: argparse.Namespace, t0: float) -> int:
             int(args.seed), int(args.power), float(args.tol_svd),
             int(args.chunk_size), args.device,
             original=(args.algorithm == 'brqn'), init_original=args.init,
+            q_hist=args.Q_hist,
         )
 
         trained: dict[int, tuple] = {}
@@ -84,7 +93,8 @@ def main(args: argparse.Namespace, t0: float) -> int:
                                 P=None if args.no_freqs else P_np)
 
             if args.plot is not None:
-                utils.plot_single_k(args, K, Q_np)
+                from .plot import plot_single_k
+                plot_single_k(args, K, Q_np)
 
             if args.cv:
                 trained[K] = (P, Q)
@@ -93,27 +103,48 @@ def main(args: argparse.Namespace, t0: float) -> int:
 
         # Combined single plot for all K sweep values
         if hasattr(args, 'plot_single') and args.plot_single is not None and len(k_values) > 1:
-            utils.plot_combined(args, k_values, trained_plot)
+            from .plot import plot_combined
+            plot_combined(args, k_values, trained_plot)
 
         del U, S, V, f
 
         # CROSS-VALIDATION (after all training):
         cv_results: dict[int, float] = {}
         if args.cv and trained:
-            use_gpu_cv = isinstance(G, torch.Tensor) and G.device.type == 'cuda'
+            from .cv import run_cross_validation
 
-            if use_gpu_cv:
-                from .cv import run_cross_validation_gpu
-                for K, (P, Q) in sorted(trained.items()):
-                    log.info(f"\n    Running {int(args.cv)}-fold CV on genotype entries for K={K}...")
-                    cv_results[K] = run_cross_validation_gpu(args, G, N, M, P, Q, device_obj, threads_per_block)
+            if training_packed:
+                del G
+                gc.collect()
+                if device_obj.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+                previous_disable = logging.root.manager.disable
+                logging.disable(logging.CRITICAL)
+                try:
+                    G_cv, N_cv, M_cv = utils.read_data(
+                        args.data_path,
+                        packed=False,
+                        chunk_size=args.chunk_size,
+                        chromosome_mode=args.chromosome_mode,
+                        autosome_count=args.autosome_count,
+                        verbose=False,
+                    )
+                finally:
+                    logging.disable(previous_disable)
+                if N_cv != N or M_cv != M:
+                    raise ValueError(
+                        f"CV reread shape mismatch: training data was N={N}, M={M}; "
+                        f"CV data is N={N_cv}, M={M_cv}."
+                    )
             else:
-                if isinstance(G, torch.Tensor):
-                    G = np.ascontiguousarray(G.numpy())
-                from .cv import run_cross_validation
-                for K, (P, Q) in sorted(trained.items()):
-                    log.info(f"\n    Running {int(args.cv)}-fold CV on genotype entries for K={K}...")
-                    cv_results[K] = run_cross_validation(args, G, N, M, K, P, Q)
+                G_cv = G if isinstance(G, np.ndarray) else np.ascontiguousarray(G.detach().cpu().numpy(), dtype=np.uint8)
+
+            for K, (P, Q) in sorted(trained.items()):
+                log.info(f"\n    Running {int(args.cv)}-fold CV on genotype entries for K={K}...")
+                cv_results[K] = run_cross_validation(args, G_cv, N, M, K, P, Q)
+            del G_cv
+            gc.collect()
 
             log.info("")
             log.info("    ---- Cross-validation summary ----")

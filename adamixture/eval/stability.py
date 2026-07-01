@@ -11,8 +11,15 @@ log = logging.getLogger("ClusterStability")
 
 def load_proportions(filepath: str) -> np.ndarray:
     """
+    Description:
     Loads ancestry proportions (Q matrix) from a file, ensures correct orientation,
     and normalizes rows to sum to 1.
+
+    Args:
+        filepath (str): Path to a text or NumPy Q matrix file.
+
+    Returns:
+        np.ndarray: Normalized Q matrix with samples in rows.
     """
     try:
         if filepath.endswith(".npy"):
@@ -37,8 +44,16 @@ def load_proportions(filepath: str) -> np.ndarray:
 
 def align_matrices(Q1: np.ndarray, Q2: np.ndarray) -> np.ndarray:
     """
+    Description:
     Matches columns of Q2 to Q1 using a greedy assignment based on
     squared Euclidean distance (minimizing Frobenius distance).
+
+    Args:
+        Q1 (np.ndarray): Reference Q matrix.
+        Q2 (np.ndarray): Query Q matrix to align.
+
+    Returns:
+        np.ndarray: Q2 with columns reordered to match Q1.
     """
     K = Q1.shape[1]
     cost_matrix = np.zeros((K, K))
@@ -72,7 +87,15 @@ def align_matrices(Q1: np.ndarray, Q2: np.ndarray) -> np.ndarray:
 
 def calculate_correlations(Q1: np.ndarray, Q2_aligned: np.ndarray) -> float:
     """
+    Description:
     Calculates the mean Pearson correlation across aligned columns.
+
+    Args:
+        Q1 (np.ndarray): Reference Q matrix.
+        Q2_aligned (np.ndarray): Aligned query Q matrix.
+
+    Returns:
+        float: Mean Pearson correlation across clusters.
     """
     K = Q1.shape[1]
     corrs = []
@@ -84,16 +107,44 @@ def calculate_correlations(Q1: np.ndarray, Q2_aligned: np.ndarray) -> float:
 
 def calculate_frobenius(Q1: np.ndarray, Q2_aligned: np.ndarray) -> float:
     """
+    Description:
     Calculates the Frobenius distance between two matrices.
+
+    Args:
+        Q1 (np.ndarray): Reference Q matrix.
+        Q2_aligned (np.ndarray): Aligned query Q matrix.
+
+    Returns:
+        float: Frobenius distance.
     """
     return np.sqrt(np.sum((Q1 - Q2_aligned) ** 2))
 
 def parse_args():
+    """
+    Description:
+    Parses command-line arguments for cluster stability evaluation.
+
+    Args:
+        None.
+
+    Returns:
+        argparse.Namespace: Parsed command-line arguments.
+    """
     parser = argparse.ArgumentParser(description="Evaluate cluster stability across multiple runs (seeds).")
     parser.add_argument("qfiles", nargs="+", help="Space-separated list of Q matrix files (e.g., *.Q or matrix1.npy matrix2.npy)")
     return parser.parse_args()
 
 def main():
+    """
+    Description:
+    Entry point for cluster stability evaluation across Q matrix files.
+
+    Args:
+        None.
+
+    Returns:
+        None
+    """
     args = parse_args()
 
     if len(args.qfiles) < 2:
