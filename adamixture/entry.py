@@ -178,12 +178,13 @@ def print_adamixture_banner(version: str = "1.0") -> None:
 def _fix_macos_libomp() -> None:
     """
     Description:
-    On macOS, PyTorch ships its own libomp.dylib which conflicts with
-    the Homebrew libomp used by our Cython extensions. Two different OpenMP
-    runtimes loaded simultaneously cause segfaults with multiple threads.
+    On macOS, PyTorch ships its own libomp.dylib. If the package was built
+    as a wheel, it vendors its own libomp.dylib (typically under
+    adamixture/.dylibs/libomp.dylib). Two different OpenMP runtimes loaded
+    simultaneously cause segfaults with multiple threads.
 
-    Fix: replace torch's libomp with a symlink to Homebrew's so both
-    torch and our extensions use exactly the same OpenMP runtime.
+    Fix: point the package's vendored libomp to PyTorch's libomp via a symlink,
+    ensuring only a single OpenMP runtime is loaded.
 
     Args:
         None.
@@ -194,18 +195,11 @@ def _fix_macos_libomp() -> None:
     if platform.system() != "Darwin":
         return
 
-    # Find Homebrew libomp
-    brew_omp = None
-    for p in ["/opt/homebrew/opt/libomp/lib/libomp.dylib",
-              "/usr/local/opt/libomp/lib/libomp.dylib"]:
-        if os.path.exists(p):
-            brew_omp = p
-            break
-
-    if brew_omp is None:
+    pkg_omp = os.path.join(os.path.dirname(__file__), ".dylibs", "libomp.dylib")
+    # If the vendored libomp does not exist or is already a symlink, nothing to do.
+    if not os.path.exists(pkg_omp) or os.path.islink(pkg_omp):
         return
 
-    # Find torch's libomp
     try:
         import torch as _torch
         torch_omp = os.path.join(os.path.dirname(_torch.__file__), "lib", "libomp.dylib")
@@ -215,24 +209,20 @@ def _fix_macos_libomp() -> None:
     if not os.path.exists(torch_omp):
         return
 
-    # Already a symlink pointing to the right place? Nothing to do.
-    if os.path.islink(torch_omp) and os.path.realpath(torch_omp) == os.path.realpath(brew_omp):
+    # Check if they already resolve to the same file.
+    if os.path.realpath(pkg_omp) == os.path.realpath(torch_omp):
         return
 
-    # Not a symlink (or points elsewhere) → fix it
     try:
-        backup = torch_omp + ".bak"
+        backup = pkg_omp + ".bak"
         if not os.path.exists(backup):
-            os.rename(torch_omp, backup)
+            os.rename(pkg_omp, backup)
         else:
-            os.remove(torch_omp)
-        os.symlink(brew_omp, torch_omp)
-        log.info(f"    Fixed OpenMP conflict: linked torch's libomp → {brew_omp}")
+            os.remove(pkg_omp)
+        os.symlink(os.path.realpath(torch_omp), pkg_omp)
+        log.info("    Fixed OpenMP conflict: linked vendored libomp → torch's libomp")
     except OSError as e:
-        log.warning(f"    Could not fix OpenMP conflict automatically: {e}")
-        log.warning("    To fix manually, run:")
-        log.warning(f"      mv {torch_omp} {torch_omp}.bak")
-        log.warning(f"      ln -s {brew_omp} {torch_omp}")
+        log.warning(f"    Could not fix OpenMP conflict: {e}")
 
 def main() -> None:
     """
