@@ -3,11 +3,14 @@ import logging
 import sys
 from pathlib import Path
 
+from ._version import __version__
+from .entry import _fix_macos_libomp, print_adamixture_banner
+
+_fix_macos_libomp()
+
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ._version import __version__
-from .entry import print_adamixture_banner
 from .src.plot import align_clusters_greedy
 
 # Global logging configuration

@@ -109,6 +109,22 @@ setup(
     ext_modules=cythonize(extensions),
     include_package_data=True,
     package_data={
-        "adamixture": ["src/utils_c/cuda/*.cu", "src/utils_c/cython/*.pyx", "src/utils_c/metal/*.metal"],
+        "adamixture": [
+            "src/utils_c/cuda/*.cu",
+            "src/utils_c/cython/*.pyx",
+            "src/utils_c/metal/*.metal",
+            "demo/README.md",
+            "demo/run_demo.sh",
+            "demo/run_diagnostics.py",
+            "demo/generate_device_expected.py",
+            "demo/data/*",
+            "demo/outputs/reader/*.expected",
+            "demo/outputs/cpu/brqn/*.expected",
+            "demo/outputs/cpu/adamem/*.expected",
+            "demo/outputs/gpu/brqn/*.expected",
+            "demo/outputs/gpu/adamem/*.expected",
+            "demo/outputs/mps/brqn/*.expected",
+            "demo/outputs/mps/adamem/*.expected",
+        ],
     },
 )

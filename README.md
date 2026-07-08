@@ -50,6 +50,12 @@ $ pip install adamixture
 
 To train a model, simply invoke the following commands from the root directory of the project. For more info about all the arguments, please run `adamixture --help`. Note that **BED**, **VCF** and **PGEN** are supported.
 
+Supported input files include:
+
+- PLINK BED: `.bed`, `.bed.gz`, `.bed.zst`, with `.bim`/`.fam` sidecars that may also be plain, `.gz` or `.zst`.
+- PLINK PGEN: `.pgen` or `.pgen.zst`, with `.pvar`/`.psam` sidecars that may be plain, `.gz` or `.zst`.
+- VCF: `.vcf`, `.vcf.gz` and `.vcf.zst`.
+
 As an example, the following ADMIXTURE call
 
 ```console

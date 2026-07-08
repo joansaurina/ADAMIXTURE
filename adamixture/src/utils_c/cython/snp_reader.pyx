@@ -4,7 +4,17 @@ from libc.stdlib cimport calloc, free, malloc, realloc, atoi
 from libc.stdint cimport uint8_t, uint32_t, uintptr_t, int32_t, uint64_t
 
 import gzip
+import io
 import numpy as np
+
+
+def _open_vcf_file(str filepath):
+    if filepath.endswith('.gz'):
+        return gzip.open(filepath, 'rb')
+    if filepath.endswith('.zst'):
+        import zstandard as zstd
+        return io.BufferedReader(zstd.open(filepath, 'rb'))
+    return open(filepath, 'rb')
 
 cpdef void replace_missing_with_three(signed char[:, ::1] G) noexcept nogil:
     """
@@ -432,7 +442,7 @@ cdef inline bint _keep_chromosome_line(const char* line, bint keep_all, int auto
 def read_vcf_file(str filepath, int chunk_size, str chromosome_mode, int autosome_count):
     """
     Description:
-    Reads a VCF file (plain or gzip) into a uint8 NumPy matrix using a memory-efficient chunking strategy.
+    Reads a VCF file (plain, gzip, or zstd) into a uint8 NumPy matrix using a memory-efficient chunking strategy.
 
     Args:
         filepath (str): Path to the VCF file.
@@ -456,8 +466,7 @@ def read_vcf_file(str filepath, int chunk_size, str chromosome_mode, int autosom
     if autosome_count < 1:
         raise ValueError("autosome_count must be at least 1")
 
-    is_gz = filepath.endswith('.gz')
-    fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
+    fh = _open_vcf_file(filepath)
     try:
         for line in fh:
             if line.startswith(b'#'):
@@ -481,7 +490,7 @@ def read_vcf_file(str filepath, int chunk_size, str chromosome_mode, int autosom
 
     cdef uint8_t[:, ::1] G = np.empty((n_variants, n_samples), dtype=np.uint8)
 
-    fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
+    fh = _open_vcf_file(filepath)
     chunk_bytes = []
     
     try:
@@ -583,8 +592,7 @@ def read_vcf_file_packed(str filepath, int chunk_size, str chromosome_mode, int 
     if autosome_count < 1:
         raise ValueError("autosome_count must be at least 1")
 
-    is_gz = filepath.endswith('.gz')
-    fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
+    fh = _open_vcf_file(filepath)
     try:
         for line in fh:
             if line.startswith(b'#'):
@@ -612,7 +620,7 @@ def read_vcf_file_packed(str filepath, int chunk_size, str chromosome_mode, int 
     if chunk_size % 4 != 0:
         chunk_size += 4 - (chunk_size % 4)
 
-    fh = gzip.open(filepath, 'rb') if is_gz else open(filepath, 'rb')
+    fh = _open_vcf_file(filepath)
     chunk_bytes = []
     
     try:

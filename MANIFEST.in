@@ -1,2 +1,3 @@
 recursive-include adamixture *.cu
 recursive-include adamixture *.pyx
+recursive-include adamixture/demo *

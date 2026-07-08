@@ -131,15 +131,47 @@ dmypy.json
 
 # Data folder contents
 **/data/**
+!adamixture/demo/
+!adamixture/demo/data/
+!adamixture/demo/data/demo_data*
+!adamixture/demo/data/demo_data.bed
+!adamixture/demo/data/demo_data.bim
+!adamixture/demo/data/demo_data.fam
+!adamixture/demo/data/demo_data.pgen
+!adamixture/demo/data/demo_data.psam
+!adamixture/demo/data/demo_data.pvar
+!adamixture/demo/data/demo_data.vcf
+!adamixture/demo/data/demo_data.vcf.gz
 
 # wandb
 **/wandb/**
 
 # logs
 logs/
+dcgm/
 
 # outputs
 outputs/
+!adamixture/demo/
+!adamixture/demo/outputs/
+adamixture/demo/outputs/*
+!adamixture/demo/outputs/reader/
+!adamixture/demo/outputs/reader/*.expected
+!adamixture/demo/outputs/cpu/
+!adamixture/demo/outputs/cpu/brqn/
+!adamixture/demo/outputs/cpu/brqn/*.expected
+!adamixture/demo/outputs/cpu/adamem/
+!adamixture/demo/outputs/cpu/adamem/*.expected
+!adamixture/demo/outputs/gpu/
+!adamixture/demo/outputs/gpu/brqn/
+!adamixture/demo/outputs/gpu/brqn/*.expected
+!adamixture/demo/outputs/gpu/adamem/
+!adamixture/demo/outputs/gpu/adamem/*.expected
+!adamixture/demo/outputs/mps/
+!adamixture/demo/outputs/mps/brqn/
+!adamixture/demo/outputs/mps/brqn/*.expected
+!adamixture/demo/outputs/mps/adamem/
+!adamixture/demo/outputs/mps/adamem/*.expected
 
 # figures
 **figures**

@@ -7,15 +7,17 @@ import time
 from pathlib import Path
 
 import configargparse
-import numpy as np
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TORCHDYNAMO_SUPPRESS_ERRORS", "1")
 
-import torch
-
 from ._version import __version__
-from .entry import print_adamixture_banner
+from .entry import _fix_macos_libomp, print_adamixture_banner
+
+_fix_macos_libomp()
+
+import numpy as np
+import torch
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
