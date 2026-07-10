@@ -193,7 +193,7 @@ Key arguments:
 
 ## Algorithm note
 
-The ADAMIXTURE paper introduced Adam-EM as an adaptive first-order optimizer for admixture inference. The package still includes this solver via `--algorithm adamem`.
+The ADAMIXTURE [paper](https://doi.org/10.1093/bioinformatics/btag236) introduced Adam-EM as an adaptive first-order optimizer for admixture inference. The package still includes this solver via `--algorithm adamem`.
 
 In the current implementation, the default is `--algorithm brqn`. Empirical benchmarking showed that block relaxation with ZAL quasi-Newton acceleration, when paired with our improved SVD+ALS initialization, reaches high-quality solutions in fewer iterations and better wall-clock time. For that reason, BR-QN is the default solver, while Adam-EM remains available for experimentation and reproducibility. Adam-EM tuning parameters are documented in [Troubleshooting and Tips](docs/troubleshooting.md).
 
